@@ -62,7 +62,7 @@ def build_glm_plan(model: nn.Module) -> RotationPlan:
         "num_hidden_layers",
     ):
         value = getattr(config, name, None)
-        if type(value) is not int or value <= 0:
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             raise ValueError(f"{name} must be a positive integer")
         dimensions[name] = value
     hidden = dimensions["hidden_size"]
@@ -76,7 +76,11 @@ def build_glm_plan(model: nn.Module) -> RotationPlan:
     if len(layers) != dimensions["num_hidden_layers"]:
         raise ValueError("num_hidden_layers does not match the decoder topology")
     dense_layers = config.first_k_dense_replace
-    if type(dense_layers) is not int or not 0 <= dense_layers <= len(layers):
+    if (
+        not isinstance(dense_layers, int)
+        or isinstance(dense_layers, bool)
+        or not 0 <= dense_layers <= len(layers)
+    ):
         raise ValueError("first_k_dense_replace is outside the decoder topology")
     if any(
         hasattr(layer, "eh_proj") or hasattr(layer, "shared_head") for layer in layers

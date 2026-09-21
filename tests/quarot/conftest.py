@@ -11,6 +11,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 SOURCE = (
@@ -34,11 +35,13 @@ def pytest_addoption(parser):
     )
 
 
-def pytest_sessionstart(session):
+@pytest.fixture(scope="module", autouse=True)
+def small_thread_pool():
     # Tiny BLAS work is faster and more reproducible without a large thread pool.
-    session._quarot_threads = torch.get_num_threads()
+    # A fixture also works when this directory is discovered after session start.
+    original = torch.get_num_threads()
     torch.set_num_threads(1)
-
-
-def pytest_sessionfinish(session, exitstatus):
-    torch.set_num_threads(session._quarot_threads)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(original)

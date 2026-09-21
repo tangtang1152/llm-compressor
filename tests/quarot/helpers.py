@@ -8,11 +8,13 @@ from pathlib import Path
 
 import torch
 from quarot_under_test.rotation import make_hadamard_rotation, rotate_axis
-from source_loader import source_definitions
+
+from .source_loader import source_definitions
 
 
 def llmc_fuse(precision):
     import compressed_tensors as ct
+
     # Execute the existing LLMC function with real CT device/offload helpers,
     # avoiding LLMC's eager entrypoint imports. Nothing in its body is changed.
     module, _ = source_definitions(

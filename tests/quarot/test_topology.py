@@ -6,10 +6,11 @@ from copy import deepcopy
 
 import pytest
 import torch
-from helpers import execute, fuse_plan, matrices_for
 from quarot_under_test.mappings import build_glm_plan
-from tiny_glm import TinyConfig, TinyGLM
 from torch import nn
+
+from .helpers import execute, fuse_plan, matrices_for
+from .tiny_glm import TinyConfig, TinyGLM
 
 
 @pytest.mark.parametrize(
