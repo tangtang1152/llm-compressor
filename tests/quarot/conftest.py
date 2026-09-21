@@ -26,6 +26,14 @@ sys.modules[spec.name] = package
 spec.loader.exec_module(package)
 
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--require-quarot-reference",
+        action="store_true",
+        help="Fail instead of skipping L2 if the ModelSlim source checkout is missing",
+    )
+
+
 def pytest_sessionstart(session):
     # Tiny BLAS work is faster and more reproducible without a large thread pool.
     session._quarot_threads = torch.get_num_threads()

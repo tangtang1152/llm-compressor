@@ -42,9 +42,9 @@ def make_hadamard_rotation(
     # FP32 normalization also reproduces the reference's scalar sqrt rounding.
     normalizer = torch.tensor(block, dtype=dtype, device="cpu").sqrt()
     signed = signs.to(dtype).unsqueeze(1) * hadamard / normalizer
-    rotation = torch.kron(torch.eye(size // block, dtype=dtype), signed)
+    rotation = torch.kron(torch.eye(size // block, dtype=dtype, device="cpu"), signed)
     if shifted:
-        permutation = torch.eye(size, dtype=dtype).roll(16, dims=1)
+        permutation = torch.eye(size, dtype=dtype, device="cpu").roll(16, dims=1)
         rotation = rotation @ permutation @ rotation
     return rotation
 
