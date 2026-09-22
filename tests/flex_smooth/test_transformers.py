@@ -12,12 +12,22 @@ import torch
 from compressed_tensors.quantization import QuantizationStatus
 from compressed_tensors.quantization.lifecycle.forward import fake_quantize
 from compressed_tensors.quantization.utils import compute_dynamic_scales_and_zp
+from compressed_tensors.utils import patch_attr
+from safetensors import safe_open
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from torch.utils.data import DataLoader
-from transformers import GlmMoeDsaConfig, GlmMoeDsaForCausalLM, PreTrainedTokenizerFast
+from transformers import (
+    CompressedTensorsConfig,
+    GlmMoeDsaConfig,
+    GlmMoeDsaForCausalLM,
+    PreTrainedTokenizerFast,
+)
+from transformers.models.glm_moe_dsa import modeling_glm_moe_dsa
 
 from llmcompressor import oneshot
+from llmcompressor.core import State
+from llmcompressor.modeling.moe.linear_experts import LinearExperts2D
 from llmcompressor.modeling.moe.linearize import repack_moe
 from llmcompressor.modifiers.transform import FlexSmoothModifier, QuaRotModifier
 from llmcompressor.observers import MinMaxObserver
@@ -26,9 +36,12 @@ from llmcompressor.utils.helpers import DisableQuantization
 
 
 @pytest.mark.parametrize("pipeline", ["basic", "sequential"])
-@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize(
+    "mixed,dtype",
+    [(False, torch.float32), (True, torch.float32), (True, torch.bfloat16)],
+)
 @torch.no_grad()
-def test_official_glm_calibration_export(tmp_path, monkeypatch, pipeline, mixed):
+def test_official_glm_calibration_export(tmp_path, monkeypatch, pipeline, mixed, dtype):
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
     config = GlmMoeDsaConfig(
@@ -60,10 +73,11 @@ def test_official_glm_calibration_export(tmp_path, monkeypatch, pipeline, mixed)
     )
     with torch.random.fork_rng():
         torch.manual_seed(42)
-        model = GlmMoeDsaForCausalLM(config).eval()
+        model = GlmMoeDsaForCausalLM(config).to(dtype).eval()
     for module in model.modules():
         if type(module).__name__.endswith("RMSNorm"):
             module.weight.copy_(torch.linspace(0.6, 1.4, module.weight.numel()))
+    config.dtype = dtype
     config.save_pretrained(tmp_path / "input-config")
     config._name_or_path = str(tmp_path / "input-config")
     tokenizer = PreTrainedTokenizerFast(
@@ -98,16 +112,31 @@ def test_official_glm_calibration_export(tmp_path, monkeypatch, pipeline, mixed)
         sequential_targets=["GlmMoeDsaDecoderLayer"],
     )
     if mixed:
-        _check_mixed_quantization(model, recipe[-1], pipeline)
+        _check_mixed_quantization(model, recipe[-1], f"{pipeline}-{dtype}")
     with DisableQuantization(model):
         actual = model(tokens).logits
-    torch.testing.assert_close(actual, before, atol=2e-6, rtol=2e-5)
+    float_error = (actual.float() - before.float()).norm() / before.float().norm()
+    if dtype == torch.float32:
+        torch.testing.assert_close(actual, before, atol=2e-6, rtol=2e-5)
+    else:
+        # BF16 storage introduces rounding at each transform, unlike the strict
+        # FP32/FP64 algebra gates. This is a bounded regression diagnostic.
+        assert float_error < 0.02
+        assert (actual - before).abs().max() < 0.02
     assert len(modifier.diagnostics) == 6
     assert not modifier._hooks and not modifier._cache
     assert model.config.flex_smooth_config["status"] == "applied"
     if mixed:
-        # Quantized checkpoint/kernel compatibility is a separate server gate.
-        assert torch.isfinite(model(tokens).logits).all()
+        report = _check_compressed_roundtrip(model, tokens, tmp_path / "mixed-output")
+        report.update(
+            pipeline=pipeline,
+            dtype=str(dtype),
+            float_transform_relative_l2=float_error.item(),
+        )
+        if output := os.environ.get("FLEXSMOOTH_REPORT_DIR"):
+            Path(output, f"compressed-{pipeline}-{dtype}.json").write_text(
+                json.dumps(report, indent=2), encoding="utf-8"
+            )
         return
     repack_moe(model)
     model.save_pretrained(tmp_path / "output", save_compressed=False)
@@ -131,6 +160,107 @@ def test_official_glm_calibration_export(tmp_path, monkeypatch, pipeline, mixed)
         Path(output, f"official-glm-{pipeline}.json").write_text(
             json.dumps(report, indent=2, allow_nan=False), encoding="utf-8"
         )
+
+
+class _LinearizedGlm(GlmMoeDsaForCausalLM):
+    """Construct explicit experts before the real HF quantizer loads their weights.
+
+    Avoid Transformers' global patch scan of unrelated optional vision modules.
+    This fixture tests compressed IO, not the load_quantizable_moe context manager.
+    """
+
+    def __init__(self, config):
+        experts = LinearExperts2D.get_linear_experts_cls(
+            modeling_glm_moe_dsa.GlmMoeDsaExperts
+        )
+        with patch_attr(modeling_glm_moe_dsa, "GlmMoeDsaExperts", experts):
+            super().__init__(config)
+
+
+def _check_compressed_roundtrip(model, tokens, output):
+    expected = model(tokens).logits
+    assert torch.isfinite(expected).all()
+    snapshots = {}
+    for name, module in model.named_modules():
+        if scheme := getattr(module, "quantization_scheme", None):
+            snapshots[name] = {
+                "weight": fake_quantize(
+                    module.weight, module.weight_scale, None, scheme.weights
+                ).clone(),
+                "scale": module.weight_scale.clone(),
+                "scheme": scheme.model_dump(exclude={"format"}),
+                "bits": scheme.weights.num_bits,
+            }
+    model.save_pretrained(output, save_compressed=True)
+    saved_config = json.loads((output / "config.json").read_text())
+    assert saved_config["quantization_config"]["quantization_status"] == "compressed"
+    with safe_open(
+        output / "model.safetensors", framework="pt", device="cpu"
+    ) as checkpoint:
+        for name, snapshot in snapshots.items():
+            weight_key = "weight_packed" if snapshot["bits"] == 4 else "weight"
+            packed = checkpoint.get_tensor(f"{name}.{weight_key}")
+            assert packed.dtype == (
+                torch.uint8 if snapshot["bits"] == 4 else torch.float8_e4m3fn
+            )
+            expected_shape = list(snapshot["weight"].shape)
+            if snapshot["bits"] == 4:
+                expected_shape[-1] //= 2
+            assert list(packed.shape) == expected_shape
+            encoded_scale = checkpoint.get_tensor(f"{name}.weight_scale")
+            assert encoded_scale.dtype == torch.uint8
+            torch.testing.assert_close(
+                encoded_scale,
+                (snapshot["scale"].float().log2() + 127).to(torch.uint8),
+                atol=0,
+                rtol=0,
+            )
+    restored, loading = _LinearizedGlm.from_pretrained(
+        output,
+        local_files_only=True,
+        attn_implementation="eager",
+        dtype=model.dtype,
+        quantization_config=CompressedTensorsConfig(dequantize=True),
+        output_loading_info=True,
+    )
+    assert not any(loading.values()), loading
+    raw_weight_dtypes = sorted(
+        {str(restored.get_submodule(name).weight.dtype) for name in snapshots}
+    )
+    # CT MX decompressors currently materialize BF16 weights even for dtype=FP32.
+    # Normalize explicitly before executing the FP32 diagnostic fixture.
+    restored.to(dtype=model.dtype).eval()
+    for name, snapshot in snapshots.items():
+        module = restored.get_submodule(name)
+        torch.testing.assert_close(module.weight, snapshot["weight"], atol=0, rtol=0)
+        torch.testing.assert_close(
+            module.weight_scale, snapshot["scale"], atol=0, rtol=0
+        )
+        assert (
+            module.quantization_scheme.model_dump(exclude={"format"})
+            == snapshot["scheme"]
+        )
+        assert module.quantization_scheme.format == (
+            "mxfp4-pack-quantized" if snapshot["bits"] == 4 else "mxfp8-quantized"
+        )
+        assert module.quantization_scheme.input_activations.dynamic
+    actual = restored(tokens).logits
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert restored.config.flex_smooth_config == model.config.flex_smooth_config
+    assert restored.config.quarot_config == model.config.quarot_config
+    for modifier in (QuaRotModifier(block_size=32), FlexSmoothModifier()):
+        with pytest.raises(ValueError, match="already has"):
+            modifier.initialize(State(model=restored))
+    return {
+        "real_weights": False,
+        "loader": "scoped explicit GLM experts + HF quantizer",
+        "raw_decompressed_weight_dtypes": raw_weight_dtypes,
+        "explicit_dtype_normalization": str(model.dtype),
+        "quantized_modules": len(snapshots),
+        "weights_and_scales_exact": True,
+        "reload_logits_max_abs_error": (actual - expected).abs().max().item(),
+        "packed_bytes": sum(p.stat().st_size for p in output.glob("*.safetensors")),
+    }
 
 
 def _check_mixed_quantization(model, modifier, pipeline):
@@ -167,7 +297,9 @@ def _check_mixed_quantization(model, modifier, pipeline):
         expected_scale = observer(module.weight).get_qparams()["scale"]
         torch.testing.assert_close(module.weight_scale, expected_scale, atol=0, rtol=0)
         # Check actual wrapped execution against an explicit dynamic input Q/DQ path.
-        x = torch.linspace(-2, 2, module.in_features).repeat(2, 1)
+        x = torch.linspace(-2, 2, module.in_features, dtype=module.weight.dtype).repeat(
+            2, 1
+        )
         x[1] *= 8
         scale, zp = compute_dynamic_scales_and_zp(x, scheme.input_activations, module)
         assert not torch.equal(scale[0], scale[1])

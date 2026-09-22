@@ -60,5 +60,14 @@ tested on the official tiny GLM in basic/sequential pipelines, including exact
 post-transform weight scales and explicit dynamic-input Q/DQ execution. The
 standalone server header probe is tested with generated single/sharded checkpoints
 and no site-packages. See `examples/glm52_precision/README.md` for the handoff.
-Quantized export, server kernels, KV-cache quantization and real-model L4/L5 remain
-separate gates. No full-model accuracy claim follows from local tests.
+The suite also checks actual mixed compressed export/reload in FP32/BF16 using a
+scoped explicit-GLM expert constructor and the real HF quantizer. Packed weights,
+E8M0 bytes, restored Q/DQ weights/scales, schemes, transform metadata and logits are
+checked, including repeated-transform rejection. CT's BF16 decompression is followed
+by explicit dtype normalization. Full FP32/BF16 mixed CPU/disk offload state matches
+the resident run exactly; disk Q/DQ forwards use the sequential pipeline's cache
+lifetime context. Existing config-resave regressions run in the combined gate.
+See `examples/glm52_precision/runtime_limits.md` for the generic loader dependency,
+decompression dtype and bare disk-forward limitations found by these tests.
+Server kernels, KV-cache quantization and real-model L4/L5 remain separate gates.
+No full-model accuracy claim follows from local tests.

@@ -68,7 +68,12 @@ def main():
         f"--junitxml={xml}",
     ]
     if args.include_flex_smooth:
-        command.append("tests/flex_smooth")
+        command.extend(
+            [
+                "tests/flex_smooth",
+                "tests/llmcompressor/transformers/compression/test_resave_config.py",
+            ]
+        )
         env.update(FLEXSMOOTH_REQUIRE_REFERENCE="1", FLEXSMOOTH_REPORT_DIR=str(output))
     started = time.perf_counter()
     versions = {
@@ -102,8 +107,10 @@ def main():
         )
         + (
             "; also FlexSmooth norm-linear/OV L0-L3, basic/sequential linear mixed "
-            "MXFP4/MXFP8 composition, and header-only server probe fixtures; "
-            "NOT quantized export, server kernels, KV-cache quantization or real L4"
+            "MXFP4/MXFP8 composition, FP32/BF16 compressed roundtrip with scoped GLM "
+            "expert construction and explicit dtype normalization, cache-aligned "
+            "CPU/disk offload, config persistence and header-only server fixtures; "
+            "NOT generic loader compatibility, server kernels, KV-cache or real L4"
             if args.include_flex_smooth
             else ""
         ),
@@ -134,6 +141,12 @@ def main():
                             *repo.joinpath("tests/flex_smooth").glob("*.py"),
                             repo / "examples/glm52_precision/mixed_mxfp.yaml",
                             repo / "tools/glm52_precision_probe.py",
+                            repo
+                            / "src/llmcompressor/transformers/compression"
+                            / "compressed_tensors_utils.py",
+                            repo
+                            / "tests/llmcompressor/transformers/compression"
+                            / "test_resave_config.py",
                         ]
                         if args.include_flex_smooth
                         else []

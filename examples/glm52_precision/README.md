@@ -5,6 +5,7 @@
 `mixed_mxfp.yaml` 使用独立的 QuaRotModifier → FlexSmoothModifier →
 QuantizationModifier。官方 Transformers 随机 tiny GLM 的 basic / sequential
 两条管线验证目标分配、变换后的权重 scale、动态激活 Q/DQ、浮点等价性和清理。
+另有 FP32/BF16 压缩 checkpoint 保存与重载，以及 CPU/disk offload 对照。
 
 - MXFP8：q_a/q_b、kv_a、o_proj、indexer.wq_b、dense MLP、shared experts。
 - MXFP4：routed experts 的 gate/up/down。
@@ -12,9 +13,17 @@ QuantizationModifier。官方 Transformers 随机 tiny GLM 的 basic / sequentia
 - group_size=32，激活动态 scale，权重静态 scale。
 
 这只对应 ModelSlim 示例的 linear_quant 部分。没有实现 FA3/indexer-score 或
-KV-cache 量化，也没有验证 NPU kernel、量化 checkpoint 导出/部署及真实模型精度。
+KV-cache 量化，也没有验证 NPU kernel、通用生产加载器/部署及真实模型精度。
 FlexSmooth 的 INT8 搜索代理和最终 MXFP 格式不同，这是 reference 的算法设计。
 该 recipe 的 max_tokens=128 是受控实验上限，并非已验证的生产校准设置。
+
+压缩文件自测检查 MXFP4 packed uint8、MXFP8 float8 权重、E8M0 uint8 scale，
+经实际 HF quantizer 解压后逐项比较权重、scale、量化配置和 logits。
+重载采用测试内限定到 GLM 的 explicit experts 构造，且对解压权重显式统一 dtype。
+CPU/disk 变换后的状态与常驻内存版本逐位一致；磁盘 Q/DQ 诊断使用与 sequential
+pipeline 相同的 `disable_offloading()` 生命周期上下文，避免重复取权重时丢失临时 Q/DQ。
+该上下文仅包围 tiny 诊断前向，不是让真实大模型全部驻留内存的建议。
+具体依赖兼容缺口见 [runtime_limits.md](runtime_limits.md)。
 
 本机完整检查（无需任何真实 checkpoint）：
 
