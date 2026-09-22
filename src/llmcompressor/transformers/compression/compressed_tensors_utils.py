@@ -265,8 +265,7 @@ def resave_config(config: PretrainedConfig, save_dir: str):
     sometimes supports loading the transformers-serialized one. To stay
     compatible, this loads the original config file referenced by
     ``config._name_or_path``, overwrites only the fields that llmcompressor has
-    changed (currently the expert-count fields in
-    :data:`NUM_EXPERTS_CONFIG_KEYS`, which change under REAP expert pruning),
+    changed (dtype, tied embeddings, expert counts and precision-transform state),
     and writes the result to ``save_dir/config.json``.
 
     :param config: the (possibly modified) model config, used both to locate the
@@ -337,6 +336,12 @@ def resave_config(config: PretrainedConfig, save_dir: str):
             "Failed to modify config. Keeping the transformers-serialized config."
         )
         return
+
+    # Transform completion markers and diagnostics are added after model loading.
+    # Dropping them here would let a reloaded model apply the transforms twice.
+    for key in ("quarot_config", "flex_smooth_config"):
+        if key in src_config:
+            tgt_config[key] = src_config[key]
 
     save_path = os.path.join(save_dir, "config.json")
     with open(save_path, "w") as file:
