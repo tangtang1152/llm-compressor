@@ -1,30 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Dependency-light L0–L2 harness; deliberately not a Modifier lifecycle test.
-
-Import the pure-torch package in a private namespace, avoiding LLMC's eager
-entrypoint imports. No installed model/runtime package or checkpoint is needed.
-"""
-
-import importlib.util
-import sys
-from pathlib import Path
+"""Checkpoint-free L0–L3 tests using the installed LLMC package."""
 
 import pytest
 import torch
-
-SOURCE = (
-    Path(__file__).resolve().parents[2] / "src/llmcompressor/modifiers/transform/quarot"
-)
-spec = importlib.util.spec_from_file_location(
-    "quarot_under_test",
-    SOURCE / "__init__.py",
-    submodule_search_locations=[str(SOURCE)],
-)
-package = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = package
-spec.loader.exec_module(package)
 
 
 def pytest_addoption(parser):

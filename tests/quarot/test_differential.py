@@ -9,8 +9,9 @@ from pathlib import Path
 
 import pytest
 import torch
-from quarot_under_test.mappings import build_glm_plan
-from quarot_under_test.rotation import make_hadamard_rotation
+
+from llmcompressor.modifiers.transform.quarot.mappings import build_glm_plan
+from llmcompressor.modifiers.transform.quarot.rotation import make_hadamard_rotation
 
 from .helpers import execute, fuse_plan, matrices_for
 from .tiny_glm import TinyConfig, TinyGLM
@@ -33,6 +34,44 @@ def oracle(request):
             "L2 requires a local ModelSlim source checkout; set MODELSLIM_SOURCE"
         )
     return ModelSlimOracle(root)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@torch.no_grad()
+def test_public_modifier_matches_reference(oracle, dtype):
+    from llmcompressor.core import EventType
+    from llmcompressor.core.lifecycle import CompressionLifecycle
+    from llmcompressor.modifiers.transform import QuaRotModifier
+
+    with torch.random.fork_rng():
+        torch.manual_seed(42)
+        model = TinyGLM().to(dtype)
+    reference = deepcopy(model)
+    fusions, pre, stages, _ = oracle.plan(reference, 32)
+    for norm, consumers in fusions.items():
+        oracle.utils.fuse_ln_linear(
+            [reference.get_submodule(norm)],
+            [reference.get_submodule(name) for name in consumers],
+        )
+    oracle.rotate(reference, pre)
+    for pair in stages.values():
+        oracle.rotate(reference, pair)
+    lifecycle = CompressionLifecycle()
+    lifecycle.initialize(
+        model=model, recipe=[QuaRotModifier(block_size=32, precision="float32")]
+    )
+    lifecycle.event(EventType.CALIBRATION_START)
+    lifecycle.event(EventType.CALIBRATION_END)
+    lifecycle.finalize()
+    expected = reference.state_dict()
+    for name, value in model.state_dict().items():
+        torch.testing.assert_close(
+            value,
+            expected[name],
+            atol=2e-7,
+            rtol=2e-5 if dtype == torch.float32 else 0.008,
+            msg=name,
+        )
 
 
 @pytest.mark.parametrize(

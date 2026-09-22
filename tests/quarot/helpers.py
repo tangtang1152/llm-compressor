@@ -3,33 +3,13 @@
 
 """Test-only CPU plan executor. Does not implement the Modifier lifecycle."""
 
-from collections.abc import Iterable
-from pathlib import Path
-
 import torch
-from quarot_under_test.rotation import make_hadamard_rotation, rotate_axis
 
-from .source_loader import source_definitions
-
-
-def llmc_fuse(precision):
-    import compressed_tensors as ct
-
-    # Execute the existing LLMC function with real CT device/offload helpers,
-    # avoiding LLMC's eager entrypoint imports. Nothing in its body is changed.
-    module, _ = source_definitions(
-        Path(__file__).resolve().parents[2] / "src/llmcompressor/modeling/fuse.py",
-        ["fuse_norm_linears"],
-        {
-            "torch": torch,
-            "Iterable": Iterable,
-            "PRECISION": precision,
-            "align_module_device": ct.align_module_device,
-            "get_execution_device": ct.get_execution_device,
-            "update_offload_parameter": ct.update_offload_parameter,
-        },
-    )
-    return module.fuse_norm_linears
+from llmcompressor.modeling import fuse_norm_linears
+from llmcompressor.modifiers.transform.quarot.rotation import (
+    make_hadamard_rotation,
+    rotate_axis,
+)
 
 
 def matrices_for(plan, block_size=32, dtype=torch.float32):
@@ -43,11 +23,11 @@ def matrices_for(plan, block_size=32, dtype=torch.float32):
 
 @torch.no_grad()
 def fuse_plan(model, plan, precision):
-    fuse = llmc_fuse(precision)
     for item in plan.fusions:
-        fuse(
+        fuse_norm_linears(
             model.get_submodule(item.norm),
             [model.get_submodule(name) for name in item.consumers],
+            precision=precision,
         )
 
 

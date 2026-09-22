@@ -207,6 +207,12 @@ class Decoder(nn.Module):
 
 
 class TinyGLM(nn.Module):
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
     def __init__(self, config=None):
         super().__init__()
         self.config = c = config or TinyConfig()

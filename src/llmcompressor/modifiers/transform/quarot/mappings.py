@@ -11,6 +11,8 @@ from dataclasses import dataclass
 
 from torch import nn
 
+from llmcompressor.modeling.moe.linear_experts import LinearExperts2D
+
 
 @dataclass(frozen=True)
 class RotationSpace:
@@ -167,16 +169,25 @@ def build_glm_plan(model: nn.Module) -> RotationPlan:
             expert_names = [mlp]
         else:
             experts = getattr(layer.mlp, "experts", None)
+            # LLMC's ModuleList subclass also registers an activation module;
+            # len(experts) therefore includes one non-expert child.
+            count = (
+                experts.num_experts
+                if isinstance(experts, LinearExperts2D)
+                else len(experts)
+                if isinstance(experts, nn.ModuleList)
+                else 0
+            )
             if (
                 not isinstance(experts, nn.ModuleList)
-                or len(experts) != config.n_routed_experts
+                or count != config.n_routed_experts
             ):
                 raise ValueError(f"{mlp}: expected all explicit, unsharded experts")
             if getattr(layer.mlp, "shared_experts", None) is None:
                 raise ValueError(f"{mlp}: shared experts are required in this adapter")
-            expert_names = [f"{mlp}.experts.{i}" for i in range(len(experts))]
+            expert_names = [f"{mlp}.experts.{i}" for i in range(count)]
             expert_names += [f"{mlp}.shared_experts"]
-            weight(f"{mlp}.gate", len(experts), hidden)
+            weight(f"{mlp}.gate", count, hidden)
             consumers.append(f"{mlp}.gate")
         for expert in expert_names:
             up = weight(f"{expert}.up_proj", input=hidden)

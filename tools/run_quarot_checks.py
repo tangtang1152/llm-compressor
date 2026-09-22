@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Run the checkpoint-free QuaRot L0–L2 gate and write inspectable evidence."""
+"""Run the checkpoint-free QuaRot L0–L3 gate and write inspectable evidence."""
 
 import argparse
 import hashlib
@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -64,9 +65,12 @@ def main():
     started = time.perf_counter()
     versions = {
         name: importlib.metadata.version(name)
-        for name in ("torch", "pytest", "numpy", "compressed-tensors")
+        for name in ("torch", "transformers", "pytest", "numpy", "compressed-tensors")
     }
-    completed = subprocess.run(command, cwd=repo, env=env)
+    # Allocate a unique directory owned by this run; pytest clears its basetemp.
+    with tempfile.TemporaryDirectory(prefix="pytest-", dir=output) as temporary:
+        command.append(f"--basetemp={temporary}")
+        completed = subprocess.run(command, cwd=repo, env=env)
     counts = {}
     if xml.is_file():
         suites = ET.parse(xml).getroot().iter("testsuite")
@@ -83,7 +87,11 @@ def main():
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "elapsed_seconds": time.perf_counter() - started,
         "passed": passed,
-        "scope": "Initial power-of-two, explicit-expert, non-MTP L0-L2 slice; NOT L3",
+        "scope": (
+            "Power-of-two non-MTP QuaRot L0-L3: source differential, public lifecycle, "
+            "CPU/disk offload, official tiny GLM oneshot and local reload; "
+            "NOT real-model verification"
+        ),
         "python": sys.version,
         "dependencies": versions,
         "llmc": git_info(repo),

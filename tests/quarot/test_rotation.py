@@ -3,7 +3,11 @@
 
 import pytest
 import torch
-from quarot_under_test.rotation import make_hadamard_rotation, rotate_axis
+
+from llmcompressor.modifiers.transform.quarot.rotation import (
+    make_hadamard_rotation,
+    rotate_axis,
+)
 
 
 @pytest.mark.parametrize(

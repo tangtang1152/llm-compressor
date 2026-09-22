@@ -6,14 +6,10 @@ Run from the repository root:
 python -m pytest tests/quarot/test_rotation.py -q -p no:cacheprovider
 ```
 
-Only PyTorch and pytest are needed for tensor and topology-only tests. Tests load the pure-torch
-implementation under a private namespace to avoid LLMC's eager optional runtime
-imports. This is not a substitute for the later normal-import Modifier/recipe L3 gate.
-No model downloads, `from_pretrained`, NPU, GPU, or datasets are used.
-
-Tiny norm-fusion/forward tests also require compressed-tensors; they execute the
-existing LLMC fuse function with real CT offload helpers in a private namespace.
-The tests do not mock those helpers, but CPU-resident use is not an offload test.
+Install the repository and its declared dependencies in an isolated CPU environment,
+plus pytest. All tests now use normal public LLMC imports; runtime APIs are not stubbed.
+No model downloads, NPU, GPU, or datasets are used. The only checkpoints saved or
+loaded are tiny random fixtures generated within tests.
 
 For L2 set `MODELSLIM_SOURCE` to a local, unchanged ModelSlim source checkout
 (or use the workspace's sibling `reference/msmodelslim`). NumPy and packaging are
@@ -39,7 +35,20 @@ numeric codes are irrelevant to numerical comparisons. Non-power-of-two asset lo
 is unsupported. Only named MTP-only targets are removed from the decoder reference
 mapping. Every other target must resolve. No reference implementation is vendored.
 
-This harness is an early correctness gate, not upstream-ready GLM-5.2 support.
-MTP, full non-power-of-two bases, fused/distributed experts, MLA decode caches,
-Modifier lifecycle, recipe serialization and mixed MXFP composition remain separate
-tests to build. No accuracy or production deployment claims follow from this gate.
+L3 covers public Modifier events, recipe YAML round-trip, duplicate-application guards,
+tied CPU embeddings, real CPU/disk offload caches and runtime failure state. Official
+`GlmMoeDsaForCausalLM` random tiny configs exercise full/shared and full/full indexers
+through `oneshot`, native expert repacking, local save and reload. This complements
+the controlled mathematical fixture `tiny_glm.py`; neither predicts real accuracy.
+On Windows run in a context that can access pytest's private temporary directories.
+
+Current limits: power-of-two blocks, explicit unsharded experts (including LLMC's
+linearized experts), no MTP or online rotations. Shared disk-backed embedding
+parameters must be untied before offloading. Invalid topology fails before mutation;
+unexpected I/O/OOM failures mark config state `failed` and require a fresh model,
+without allocating a model-sized rollback copy. Persisted `quarot_config` metadata
+prevents accidentally applying a new modifier to an already transformed model.
+
+Non-power-of-two full bases, distributed execution, production MLA decode caches,
+FlexSmooth and mixed MXFP composition remain separate gates. No real-model accuracy
+or deployment claim follows from these tests.

@@ -6,8 +6,9 @@ from copy import deepcopy
 
 import pytest
 import torch
-from quarot_under_test.mappings import build_glm_plan
 from torch import nn
+
+from llmcompressor.modifiers.transform.quarot.mappings import build_glm_plan
 
 from .helpers import execute, fuse_plan, matrices_for
 from .tiny_glm import TinyConfig, TinyGLM
