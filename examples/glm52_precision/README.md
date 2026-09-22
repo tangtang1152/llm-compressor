@@ -75,6 +75,10 @@ indexer/expert 布局、MTP 排除和共享参数关系仍需结合返回信息�
 
 ## 后续单层 L4 的最小数据及判定
 
+已提供 [L4 第一阶段数值脚本及运行说明](l4.md)：指定一层 attention 权重，
+先执行合成输入预检查，再接入已有 BF16 推理流程采集 baseline cache。
+此阶段验证 QuaRot/FlexSmooth 的独立 attention 子图，不等于以下完整单层目标均已完成。
+
 布局确认后，选择 full/shared indexer 各一层（若存在），复用服务器推理流程采集
 最多 128 tokens 的真实 activation cache；不进行整模型量化。
 需要 input_layernorm、q_a_layernorm、kv_a_layernorm、o_proj 的输入，mask/positions，
