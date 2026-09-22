@@ -132,7 +132,11 @@ class FlexSmoothModifier(Modifier):
                         raise ValueError(
                             "FlexSmooth must run before weight quantization"
                         )
-                    for parameter in module.parameters(recurse=False):
+                    # Initialized MXFP scales are uint8 metadata, not transform inputs.
+                    for parameter_name in ("weight", "bias"):
+                        parameter = getattr(module, parameter_name, None)
+                        if parameter is None:
+                            continue
                         if parameter.layout != torch.strided:
                             raise ValueError(f"{name}: dense parameters required")
                         if parameter.dtype not in (

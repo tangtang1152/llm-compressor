@@ -139,7 +139,12 @@ class QuaRotModifier(Modifier):
                     "initialized",
                 ):
                     raise ValueError("QuaRot must run before quantization calibration")
-                for parameter in module.parameters(recurse=False):
+                # Quantization initialization also registers integer scale metadata.
+                # Only the floating weight/bias participate in this transform.
+                for parameter_name in ("weight", "bias"):
+                    parameter = getattr(module, parameter_name, None)
+                    if parameter is None:
+                        continue
                     if parameter.dtype not in (
                         torch.float16,
                         torch.bfloat16,
