@@ -1,5 +1,10 @@
 # GLM-5.2 precision verification
 
+**2026-09-23 数值对齐结论：mixed MXFP 尚未对齐 ModelSlim。** 独立源码对比发现
+scale、中点舍入、小值策略和 BF16 边界差异；104 个 tensor 用例中 52 个存在差异，
+4 个随机 linear 用例中 3 个输出不同。详见 [MXFP differential](../../tests/mxfp/README.md)。
+下文的组合／导出往返测试通过，并不等同于跨框架量化结果一致。
+
 ## 本机已经验证的范围
 
 `mixed_mxfp.yaml` 使用独立的 QuaRotModifier → FlexSmoothModifier →
