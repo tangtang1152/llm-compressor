@@ -35,6 +35,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--modelslim-source", type=Path, required=True)
     parser.add_argument("--report-dir", type=Path, required=True)
+    parser.add_argument(
+        "--include-flex-smooth",
+        action="store_true",
+        help="Also require FlexSmooth L0-L3 and QuaRot composition",
+    )
     args = parser.parse_args()
     reference = args.modelslim_source.resolve()
     if not (reference / "msmodelslim/model/glm_5/quarot.py").is_file():
@@ -62,6 +67,9 @@ def main():
         "--require-quarot-reference",
         f"--junitxml={xml}",
     ]
+    if args.include_flex_smooth:
+        command.append("tests/flex_smooth")
+        env.update(FLEXSMOOTH_REQUIRE_REFERENCE="1", FLEXSMOOTH_REPORT_DIR=str(output))
     started = time.perf_counter()
     versions = {
         name: importlib.metadata.version(name)
@@ -91,6 +99,12 @@ def main():
             "Power-of-two non-MTP QuaRot L0-L3: source differential, public lifecycle, "
             "CPU/disk offload, official tiny GLM oneshot and local reload; "
             "NOT real-model verification"
+        )
+        + (
+            "; also FlexSmooth norm-linear/OV L0-L3 and QuaRot composition, "
+            "NOT mixed MXFP quantization"
+            if args.include_flex_smooth
+            else ""
         ),
         "python": sys.version,
         "dependencies": versions,
@@ -109,7 +123,18 @@ def main():
                     ),
                     *repo.joinpath("tests/quarot").glob("*.py"),
                     repo / "src/llmcompressor/modeling/fuse.py",
+                    repo / "src/llmcompressor/modifiers/transform/__init__.py",
                     Path(__file__).resolve(),
+                    *(
+                        [
+                            *repo.joinpath(
+                                "src/llmcompressor/modifiers/transform/flex_smooth"
+                            ).glob("*.py"),
+                            *repo.joinpath("tests/flex_smooth").glob("*.py"),
+                        ]
+                        if args.include_flex_smooth
+                        else []
+                    ),
                 ]
             )
         },
