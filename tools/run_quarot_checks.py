@@ -101,8 +101,9 @@ def main():
             "NOT real-model verification"
         )
         + (
-            "; also FlexSmooth norm-linear/OV L0-L3 and QuaRot composition, "
-            "NOT mixed MXFP quantization"
+            "; also FlexSmooth norm-linear/OV L0-L3, basic/sequential linear mixed "
+            "MXFP4/MXFP8 composition, and header-only server probe fixtures; "
+            "NOT quantized export, server kernels, KV-cache quantization or real L4"
             if args.include_flex_smooth
             else ""
         ),
@@ -131,6 +132,8 @@ def main():
                                 "src/llmcompressor/modifiers/transform/flex_smooth"
                             ).glob("*.py"),
                             *repo.joinpath("tests/flex_smooth").glob("*.py"),
+                            repo / "examples/glm52_precision/mixed_mxfp.yaml",
+                            repo / "tools/glm52_precision_probe.py",
                         ]
                         if args.include_flex_smooth
                         else []

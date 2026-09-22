@@ -55,5 +55,10 @@ reapplication; unexpected mutation failures require a fresh model.
 Initial limits: unsharded explicit GLM projections and expanded MLA V heads; no MTP,
 mixed dtypes among norm consumers, loss masks, split-subgraph sequential partitions
 or distributed execution. Grouped OV scale math is tested, but a grouped-KV model
-adapter is not implemented. Dynamic mixed MXFP4/MXFP8 composition and real-model
-L4/L5 remain separate gates. No full-model accuracy claim follows from local tests.
+adapter is not implemented. Dynamic mixed MXFP4/MXFP8 linear composition is also
+tested on the official tiny GLM in basic/sequential pipelines, including exact
+post-transform weight scales and explicit dynamic-input Q/DQ execution. The
+standalone server header probe is tested with generated single/sharded checkpoints
+and no site-packages. See `examples/glm52_precision/README.md` for the handoff.
+Quantized export, server kernels, KV-cache quantization and real-model L4/L5 remain
+separate gates. No full-model accuracy claim follows from local tests.
