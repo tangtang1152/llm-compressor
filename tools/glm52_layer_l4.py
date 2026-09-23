@@ -337,7 +337,11 @@ def trace_checks(actual, expected, hidden_rotation=None):
                 "attention_output",
                 "mlp_output",
             ):
-                value = value @ hidden_rotation
+                rotation = hidden_rotation.to(
+                    device=value.device,
+                    dtype=value.dtype,
+                )
+                value = value @ rotation
             checks[name] = compare(other, value, 1e-4)
     return checks
 
