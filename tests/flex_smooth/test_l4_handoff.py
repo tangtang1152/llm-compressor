@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import os
 from dataclasses import asdict
 from pathlib import Path
 
@@ -13,6 +14,19 @@ from safetensors.torch import save_file
 from tests.quarot.tiny_glm import TinyGLM
 from tools import glm52_l4 as l4
 from tools.glm52_l4_capture import capture_inputs
+
+
+@pytest.fixture
+def modelslim_source():
+    root = Path(
+        os.environ.get(
+            "MODELSLIM_SOURCE",
+            Path(__file__).resolve().parents[4] / "reference/msmodelslim",
+        )
+    )
+    if not root.is_dir():
+        pytest.skip("External ModelSlim source required for handoff integration")
+    return root
 
 
 @pytest.fixture
@@ -122,13 +136,13 @@ def test_only_selected_payloads_and_cache_provenance(fixture, tmp_path, monkeypa
 @pytest.mark.parametrize(
     "layer,dtype", [(0, torch.float32), (1, torch.float32), (0, torch.bfloat16)]
 )
-def test_real_source_numerical_handoff(fixture, tmp_path, layer, dtype):
+def test_real_source_numerical_handoff(
+    fixture, tmp_path, layer, dtype, modelslim_source
+):
     model, root = fixture
     model.to(dtype)
     save_file(model.state_dict(), str(root / "model.safetensors"))
-    reference = Path(__file__).resolve().parents[4] / "reference/msmodelslim"
-    if not reference.is_dir():
-        pytest.skip("External ModelSlim source required for handoff integration")
+    reference = modelslim_source
     path = tmp_path / "cache" / "inputs.safetensors"
     capture(model, root, path, layer)
     output = tmp_path / f"report-{layer}.json"
@@ -246,11 +260,11 @@ def test_capture_missing_hooks_and_changed_weights(fixture, tmp_path):
         )
 
 
-def test_runner_injected_transform_failure_is_reported(fixture, tmp_path, monkeypatch):
+def test_runner_injected_transform_failure_is_reported(
+    fixture, tmp_path, monkeypatch, modelslim_source
+):
     _, root = fixture
-    reference = Path(__file__).resolve().parents[4] / "reference/msmodelslim"
-    if not reference.is_dir():
-        pytest.skip("External ModelSlim source required")
+    reference = modelslim_source
     original = l4.rotate_axis
     monkeypatch.setattr(
         l4, "rotate_axis", lambda *args, **kwargs: original(*args, **kwargs) + 0.01

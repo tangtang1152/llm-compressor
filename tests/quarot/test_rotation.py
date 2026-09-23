@@ -3,6 +3,7 @@
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from llmcompressor.modifiers.transform.quarot.rotation import (
     make_hadamard_rotation,
@@ -76,6 +77,50 @@ def test_noncontiguous_roundtrip():
     q = make_hadamard_rotation(8, dtype=torch.float64)
     result = rotate_axis(rotate_axis(value, q, axis=0), q.T, axis=0)
     torch.testing.assert_close(result, value, atol=1e-12, rtol=1e-12)
+
+
+@pytest.mark.parametrize(
+    "shape,axis,stride,offset",
+    [
+        ((32, 192), 0, 32, 0),
+        ((32, 192), 1, 48, 16),
+        ((3, 32, 192), 1, 32, 0),
+        ((32,), 0, 32, 0),
+    ],
+)
+def test_rotation_uses_unbatched_gemm(shape, axis, stride, offset):
+    """A transposed O projection must not broadcast Q over every input channel.
+
+    Guard dispatch on small tensors instead of reproducing the server's OOM at
+    [6144, 16384]. Also exercise repeated segments, higher ranks and a bias.
+    """
+    generator = torch.Generator().manual_seed(91)
+    value = torch.randn(shape, dtype=torch.float64, generator=generator)
+    original = value.clone()
+    rotation = make_hadamard_rotation(32, dtype=torch.float64)
+    block = torch.eye(stride, dtype=torch.float64)
+    block[offset : offset + 32, offset : offset + 32] = rotation
+    full = torch.block_diag(*[block] * (shape[axis] // stride))
+    expected = torch.einsum("...j,jk->...k", value.movedim(axis, -1), full)
+    expected = expected.movedim(-1, axis)
+
+    class UnbatchedGemmOnly(TorchDispatchMode):
+        def __init__(self):
+            self.calls = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func in (torch.ops.aten.bmm.default, torch.ops.aten.baddbmm.default):
+                raise AssertionError("Rotation must not batch/broadcast the matrix")
+            if func is torch.ops.aten.mm.default:
+                assert args[0].ndim == args[1].ndim == 2
+                self.calls += 1
+            return func(*args, **(kwargs or {}))
+
+    with UnbatchedGemmOnly() as mode:
+        result = rotate_axis(value, rotation, axis=axis, stride=stride, offset=offset)
+    assert mode.calls == 1
+    torch.testing.assert_close(result, expected, atol=1e-12, rtol=1e-12)
+    assert torch.equal(value, original)
 
 
 @pytest.mark.parametrize(

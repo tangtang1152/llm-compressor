@@ -85,5 +85,12 @@ def rotate_axis(
     result = grouped.clone()
     segment = grouped[..., offset : offset + size].to(precision)
     matrix = rotation.to(device=value.device, dtype=precision)
-    result[..., offset : offset + size] = (segment @ matrix).to(value.dtype)
+
+    # Flatten all leading dimensions before GEMM.  Keeping singleton/group
+    # dimensions here can route large tensors through batched matmul and cause
+    # the rotation matrix to be broadcast across the batch, producing an
+    # unnecessary and potentially enormous temporary allocation.
+    flat = segment.reshape(-1, size)
+    rotated = flat @ matrix
+    result[..., offset : offset + size] = rotated.reshape(segment.shape).to(value.dtype)
     return result.reshape(rows.shape).movedim(-1, axis)
