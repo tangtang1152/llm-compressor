@@ -25,6 +25,33 @@ from .source_loader import source_definitions
 
 
 @contextmanager
+def force_cpu_reference():
+    """Prevent the source-level ModelSlim oracle from opportunistically using NPU.
+
+    The oracle validates algorithm semantics on CPU. ModelSlim's original
+    QuaRotInterface checks torch.npu.is_available() and otherwise moves newly
+    created rotation matrices to the current NPU. On Ascend hosts this makes a
+    CPU reference test depend on runtime device availability.
+
+    Temporarily override only that availability probe while executing original
+    ModelSlim source definitions. The original function is restored afterwards.
+    """
+    npu = getattr(torch, "npu", None)
+    is_available = getattr(npu, "is_available", None) if npu is not None else None
+
+    if not callable(is_available):
+        yield
+        return
+
+    original = npu.is_available
+    npu.is_available = lambda: False
+    try:
+        yield
+    finally:
+        npu.is_available = original
+
+
+@contextmanager
 def preserve_rng():
     random_state, numpy_state = random.getstate(), np.random.get_state()
     keys = ("PYTHONHASHSEED", "HCCL_DETERMINISTIC", "CUBLAS_WORKSPACE_CONFIG")
@@ -186,7 +213,7 @@ class ModelSlimOracle:
         adapter = SimpleNamespace(config=model.config)
         for name, method in self.methods.items():
             setattr(adapter, name, MethodType(method, adapter))
-        with preserve_rng():
+        with preserve_rng(), force_cpu_reference():
             pre_fusions, fusions = adapter.get_ln_fuse_map()
             pre, pairs = adapter.get_rotate_map(block_size)
         assert pre_fusions == {}

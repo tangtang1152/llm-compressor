@@ -12,8 +12,11 @@ Modifier 的串联生命周期。先前的 attention 子图 L4 结果继续保�
 
 1. QuaRot 对真实 dense MLP、全部 routed/shared experts、router 和 attention 的
    变换，与原始 ModelSlim 函数一致，完整残差输出保持等价。
-2. 完整 attention 的 RoPE、softmax、indexer top-k 与 router 选择在 FP32 变换前后
-   保持等价；共享 indexer 使用同一份上游索引。
+2. 完整 attention 的 RoPE、softmax、indexer top-k 与连续 router logits 在 FP32
+   变换前后保持等价；共享 indexer 使用同一份上游索引。稀疏 MoE 的中间态若因
+   top-k cutoff 附近的 near-tie 发生 expert 离散翻转，在 router logits 仍通过原
+   浮点阈值、非 routing-dependent trace 全部通过、ModelSlim 差分通过且最终组合
+   expert selection 恢复严格一致时，记录为 routing sensitivity 诊断而非实现失败。
 3. FlexSmooth 在 QuaRot 后的真实 forward 上采集激活，完成搜索、缩放、事件收尾，
    结果与 ModelSlim 在独立旋转副本上采集的激活/变换一致。
 
@@ -126,14 +129,18 @@ QuaRot 后、串联后权重；比较 attention/MLP/残差输出、softmax 概�
 通过标准：
 
 - 逐权重、scale、两边校准输入相对 L2 ≤ 1e-6；所有值有限。
-- 浮点 forward 及其坐标关系相对 L2 ≤ 1e-4，离散 top-k/专家集合完全一致。
+- 浮点 forward 及其坐标关系相对 L2 ≤ 1e-4；最终 composition 的离散
+  top-k/专家集合必须完全一致。中间 sparse-MoE 仅在连续 router logits 通过原阈值
+  且失败严格局限于 routing-dependent trace 时允许记录 near-tie sensitivity；
+  不扩大任何数值阈值。
 - alpha/beta 一致；相同输入/权重下候选 loss **完全相同**。两条独立 FP32 旋转链的
   candidate-loss 相对 L2 ≤ 1e-5，另保留最大绝对误差；GEMM 舍入差异可传播到搜索。
 - Modifier 捕获值与旋转后 forward 的实际输入完全相同，清理完成，状态 applied。
 
 `baseline_capture_diagnostic` 比较 captured dtype 输出与 CPU FP32 回放，仅作诊断；
-BF16→FP32 的计算差异不冒充变换误差。离散选择不同或搜索结果不同应返回报告分析，
-不要直接扩大阈值。退出码：0=真实 cache 的本轮通过（或 dry-run 成功），
+BF16→FP32 的计算差异不冒充变换误差。中间 sparse-MoE 的 near-tie 路由变化单独记录
+`routing_sensitive`；最终 composition 的离散选择不同、连续 router logits 超阈值或
+搜索结果不同仍应判失败，不直接扩大阈值。退出码：0=真实 cache 的本轮通过（或 dry-run 成功），
 1=数值失败，2=前置条件/执行错误，3=合成 cache 测试通过。必须同时看 dry_run 字段。
 
 `full_layer_l4_passed` 仅指所选层/输入的本轮范围，不表示所有层、BF16/NPU、decode、

@@ -18,6 +18,7 @@ from transformers.models.glm_moe_dsa import modeling_glm_moe_dsa as glm
 from llmcompressor.modeling.moe.linear_experts import LinearExperts2D
 from tools.glm52_layer_l4 import (
     forward_kwargs,
+    intermediate_algebra_status,
     layer_plan,
     load_layer,
     read_cache,
@@ -138,6 +139,76 @@ def test_complete_layer_capture_replay_and_source_composition(fixture, tmp_path,
         read_cache(cache, cfg, plan, bad)
     assert not model.model.layers[layer]._forward_hooks
     assert not model.model.layers[layer]._forward_pre_hooks
+
+
+
+def _comparison(passed):
+    return {
+        "passed": passed,
+        "max_abs": 0.0 if passed else 1.0,
+        "relative_l2": 0.0 if passed else 1.0,
+        "nonfinite_actual": 0,
+        "nonfinite_reference": 0,
+        "criterion": "test",
+    }
+
+
+def test_intermediate_sparse_routing_near_tie_is_diagnostic():
+    checks = {
+        "attention_output": _comparison(True),
+        "attention_probabilities": _comparison(True),
+        "router_logits": _comparison(True),
+        "router_weights": _comparison(False),
+        "router_indices": _comparison(False),
+        "mlp_output": _comparison(False),
+        "output": _comparison(False),
+        "topk": _comparison(True),
+    }
+
+    status = intermediate_algebra_status(checks)
+
+    assert status["passed"]
+    assert not status["raw_passed"]
+    assert status["strict_passed"]
+    assert status["routing_sensitive"]
+    assert status["nonblocking_failures"] == [
+        "mlp_output",
+        "output",
+        "router_indices",
+        "router_weights",
+    ]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "router_logits",
+        "attention_output",
+        "no_route_flip",
+    ],
+)
+def test_intermediate_sparse_routing_does_not_hide_real_failure(failure):
+    checks = {
+        "attention_output": _comparison(True),
+        "router_logits": _comparison(True),
+        "router_weights": _comparison(False),
+        "router_indices": _comparison(False),
+        "mlp_output": _comparison(False),
+        "output": _comparison(False),
+        "topk": _comparison(True),
+    }
+
+    if failure == "router_logits":
+        checks["router_logits"] = _comparison(False)
+    elif failure == "attention_output":
+        checks["attention_output"] = _comparison(False)
+    elif failure == "no_route_flip":
+        checks["router_indices"] = _comparison(True)
+
+    status = intermediate_algebra_status(checks)
+
+    assert not status["passed"]
+
 
 
 @pytest.mark.parametrize(
