@@ -33,9 +33,12 @@ from llmcompressor.modifiers.transform import FlexSmoothModifier, QuaRotModifier
 from llmcompressor.observers import MinMaxObserver
 from llmcompressor.recipe import Recipe
 from llmcompressor.utils.helpers import DisableQuantization
+from tests.flex_smooth.oneshot_trace import OneshotTrace
 
 
-@pytest.mark.parametrize("pipeline", ["basic", "sequential"])
+@pytest.mark.parametrize(
+    "pipeline", ["basic", "sequential", "default", "split-rejected"]
+)
 @pytest.mark.parametrize(
     "mixed,dtype",
     [(False, torch.float32), (True, torch.float32), (True, torch.bfloat16)],
@@ -103,14 +106,30 @@ def test_official_glm_calibration_export(tmp_path, monkeypatch, pipeline, mixed,
             )
         ).modifiers
         modifier = recipe[1]
-    oneshot(
+    trace = OneshotTrace(monkeypatch) if mixed else None
+    pipeline_args = {} if pipeline == "default" else {"pipeline": pipeline}
+    targets = ["GlmMoeDsaDecoderLayer"]
+    if pipeline == "split-rejected":
+        pipeline_args = {"pipeline": "sequential", "sequential_targets_per_subgraph": 1}
+        targets = ["GlmMoeDsaAttention", "ExpertMLP"]
+    arguments = dict(
         model=model,
         processor=tokenizer,
         dataset=loader,
         recipe=recipe,
-        pipeline=pipeline,
-        sequential_targets=["GlmMoeDsaDecoderLayer"],
+        sequential_targets=targets,
+        **pipeline_args,
     )
+    if pipeline == "split-rejected":
+        # Upstream GPTQ's attention/expert partition is not automatically valid
+        # for norm-linear transforms: cached norm output crosses its boundary.
+        with pytest.raises(ValueError, match="Sequential partition splits FlexSmooth"):
+            oneshot(**arguments)
+        assert model.config.flex_smooth_config["status"] == "failed"
+        assert not modifier._hooks and not modifier._cache
+        return
+    oneshot(**arguments)
+    ordering = trace.verify(pipeline) if trace else None
     if mixed:
         _check_mixed_quantization(model, recipe[-1], f"{pipeline}-{dtype}")
     with DisableQuantization(model):
@@ -132,6 +151,7 @@ def test_official_glm_calibration_export(tmp_path, monkeypatch, pipeline, mixed,
             pipeline=pipeline,
             dtype=str(dtype),
             float_transform_relative_l2=float_error.item(),
+            event_ordering=ordering,
         )
         if output := os.environ.get("FLEXSMOOTH_REPORT_DIR"):
             Path(output, f"compressed-{pipeline}-{dtype}.json").write_text(
