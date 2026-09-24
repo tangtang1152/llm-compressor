@@ -7,18 +7,22 @@ import weakref
 from collections import defaultdict
 
 import torch
+import torch.distributed as dist
+from compressed_tensors.distributed import is_distributed, is_source_process
 from compressed_tensors.offload import (
     OffloadCache,
     align_module_device,
     get_execution_device,
     update_offload_parameter,
 )
+from compressed_tensors.offload.cache import DistributedCPUCache, DistributedDiskCache
 from compressed_tensors.utils import TorchDtype
 from pydantic import Field, PrivateAttr, field_validator
 
 from llmcompressor.core import Event, State
 from llmcompressor.modeling import fuse_norm_linears
 from llmcompressor.modifiers import Modifier
+from llmcompressor.modifiers.transform.utils.distributed import finish_transform_phase
 from llmcompressor.utils import get_high_precision, untie_word_embeddings
 
 from .mappings import RotationPlan, WeightRotation, build_glm_plan
@@ -32,7 +36,8 @@ class QuaRotModifier(Modifier):
 
     Currently supports explicit, unsharded routed/shared experts and optional
     indexers, with power-of-two Hadamard blocks. MTP, online rotations, fused
-    experts and distributed execution are not supported. No calibration samples
+    experts are not supported. Distributed execution uses CT shared CPU/disk
+    backing, rotated once by the source rank before calibration. No samples
     are required for this modifier itself.
 
     Initialization validates topology and constructs matrices without changing
@@ -77,12 +82,6 @@ class QuaRotModifier(Modifier):
                 "Model already has QuaRot state; use an untransformed model. "
                 "A failed transform cannot be retried in place."
             )
-        if (
-            torch.distributed.is_initialized()
-            and torch.distributed.get_world_size() > 1
-        ):
-            raise NotImplementedError("Distributed QuaRot is not supported")
-
         # Inspect cached shapes/identities without loading the whole model from disk.
         with OffloadCache.disable_onloading():
             plan = build_glm_plan(model)
@@ -165,7 +164,57 @@ class QuaRotModifier(Modifier):
         return plan
 
     def on_initialize(self, state: State, **kwargs) -> bool:
-        plan = self._validate_model(state.model)
+        error, signature = None, None
+        try:
+            plan = self._validate_model(state.model)
+            if is_distributed():
+                targets = {op.target for op in (plan.embedding, *plan.rotations)}
+                targets.update(fusion.norm for fusion in plan.fusions)
+                targets.update(name for f in plan.fusions for name in f.consumers)
+                layout = []
+                with OffloadCache.disable_onloading():
+                    for name in sorted(targets):
+                        module = state.model.get_submodule(name)
+                        cache = module._parameters
+                        if not isinstance(
+                            cache, (DistributedCPUCache, DistributedDiskCache)
+                        ):
+                            raise ValueError(
+                                "Distributed QuaRot requires CT shared CPU/disk "
+                                f"backing; use load_context + auto_offload: {name}"
+                            )
+                        layout.append(
+                            (
+                                name,
+                                type(cache).__name__,
+                                [
+                                    (key, tuple(value.shape), str(value.dtype))
+                                    for key in ("weight", "bias")
+                                    if (value := getattr(module, key, None)) is not None
+                                ],
+                            )
+                        )
+                signature = (
+                    plan,
+                    self.seed,
+                    self.block_size,
+                    str(self.precision),
+                    layout,
+                )
+        except Exception as caught:
+            error = caught
+        if is_distributed():
+            peers = [None] * dist.get_world_size()
+            dist.all_gather_object(peers, (str(error) if error else None, signature))
+            if any(message for message, _ in peers) or any(
+                other != signature for _, other in peers
+            ):
+                raise ValueError(
+                    "Invalid or inconsistent QuaRot initialization: "
+                    f"{[message for message, _ in peers]}"
+                ) from error
+        elif error is not None:
+            raise error
         matrices = {
             space.name: make_hadamard_rotation(
                 space.size,
@@ -204,9 +253,35 @@ class QuaRotModifier(Modifier):
             raise ValueError("QuaRot lifecycle model changed after initialization")
         if self._applied:
             return
-        if self._validate_model(model) != self._plan:
-            raise ValueError("QuaRot topology changed after initialization")
-
+        error = None
+        try:
+            if self._validate_model(model) != self._plan:
+                raise ValueError("QuaRot topology changed after initialization")
+            # Structural state must change on every rank. CT registration during
+            # untie is itself collective, so it cannot be inside the source branch.
+            with OffloadCache.disable_onloading():
+                tied = model.model.embed_tokens.weight is model.lm_head.weight
+                if is_distributed():
+                    targets = {
+                        op.target
+                        for op in (self._plan.embedding, *self._plan.rotations)
+                    }
+                    targets.update(f.norm for f in self._plan.fusions)
+                    for name in targets:
+                        module = model.get_submodule(name)
+                        for key in ("weight", "bias"):
+                            value = getattr(module, key, None)
+                            if (
+                                value is not None
+                                and value in OffloadCache.keep_onloaded_values
+                            ):
+                                raise ValueError(
+                                    "QuaRot must precede resident calibration weights"
+                                )
+            if tied:
+                untie_word_embeddings(model)
+        except Exception as caught:
+            error = caught
         metadata = {
             "status": "in_progress",
             "version": 1,
@@ -217,18 +292,21 @@ class QuaRotModifier(Modifier):
         }
         model.config.quarot_config = metadata
         try:
-            with OffloadCache.disable_onloading():
-                tied = model.model.embed_tokens.weight is model.lm_head.weight
-            if tied:
-                untie_word_embeddings(model)
-            for fusion in self._plan.fusions:
-                fuse_norm_linears(
-                    model.get_submodule(fusion.norm),
-                    [model.get_submodule(name) for name in fusion.consumers],
-                    precision=self.precision,
-                )
-            for operation in (self._plan.embedding, *self._plan.rotations):
-                self._rotate(model, operation)
+            finish_transform_phase(error, "QuaRot preparation")
+            error = None
+            try:
+                if not is_distributed() or is_source_process():
+                    for fusion in self._plan.fusions:
+                        fuse_norm_linears(
+                            model.get_submodule(fusion.norm),
+                            [model.get_submodule(name) for name in fusion.consumers],
+                            precision=self.precision,
+                        )
+                    for operation in (self._plan.embedding, *self._plan.rotations):
+                        self._rotate(model, operation)
+            except Exception as caught:
+                error = caught
+            finish_transform_phase(error, "QuaRot transform")
         except Exception:
             # A model-sized rollback copy would defeat offloading. Preflight catches
             # topology errors; unexpected I/O/OOM failures poison this model instead.

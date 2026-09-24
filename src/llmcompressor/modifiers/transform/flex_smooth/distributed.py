@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Collective search primitive; not yet connected to Modifier/offload lifecycle.
+"""Collective search used by the distributed FlexSmooth Modifier.
 
 All group members must call in the same order with replicated weights from the
 same snapshot. Only metadata, maxima and scalar moments are communicated. CPU
-Gloo is tested; this module does not initialize a backend or enable DDP modifiers.
+Gloo is tested; this module does not initialize a backend. The Modifier currently
+uses the uncapped path; global token-ID selection remains an independent primitive.
 """
 
 from dataclasses import dataclass

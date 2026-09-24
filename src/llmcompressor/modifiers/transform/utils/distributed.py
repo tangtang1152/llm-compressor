@@ -1,18 +1,36 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Collective writeback for shape-preserving transforms; lifecycle opt-in pending."""
+"""Transform phase status, plus the retained per-parameter writeback experiment."""
 
 import torch
 import torch.distributed as dist
-from compressed_tensors.distributed import get_source_rank
+from compressed_tensors.distributed import get_source_rank, is_distributed
 from compressed_tensors.offload import OffloadCache, update_offload_parameter
 from compressed_tensors.offload.cache import DistributedCPUCache, DistributedDiskCache
+
+
+def finish_transform_phase(error: Exception | None, stage: str):
+    """One CPU status reduction at a transform phase/mapping boundary.
+
+    The Ascend driver supplies cpu:gloo,npu:hccl. A failure invalidates the model;
+    no rollback is attempted. This also waits for every rank's local work.
+    """
+    if is_distributed():
+        failed = torch.tensor(int(error is not None))
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+        if failed.item():
+            raise RuntimeError(f"{stage} failed; discard model") from error
+    elif error is not None:
+        raise error
 
 
 @torch.no_grad()
 def update_transform_parameter(module: torch.nn.Module, name: str, data: torch.Tensor):
     """Commit an already computed transform after every rank finishes its old read.
+
+    Experimental primitive only; QuaRot/FlexSmooth use phase/mapping coordination
+    instead of this per-parameter protocol.
 
     All WORLD ranks must call with the same parameter order and compatible CT
     caches. The transform inputs/outputs must agree across replicas; this helper

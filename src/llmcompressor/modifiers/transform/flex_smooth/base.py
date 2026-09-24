@@ -9,6 +9,8 @@ from copy import deepcopy
 from typing import Literal
 
 import torch
+import torch.distributed as dist
+from compressed_tensors.distributed import is_distributed
 from compressed_tensors.offload import (
     OffloadCache,
     align_module_device,
@@ -19,7 +21,9 @@ from pydantic import Field, PrivateAttr, field_serializer, field_validator
 
 from llmcompressor.core import Event, State
 from llmcompressor.modifiers import Modifier
+from llmcompressor.modifiers.transform.utils.distributed import finish_transform_phase
 
+from .distributed import search_alpha_beta_distributed
 from .mappings import SmoothMapping, apply_scales, glm_mappings
 from .search import NoFiniteCandidateError, ov_scales, search_alpha_beta, smooth_scale
 
@@ -40,6 +44,7 @@ class FlexSmoothModifier(Modifier):
     :param max_tokens: cache the first N tokens per subgraph on CPU. None retains
         all tokens, matching reference collection. A cap changes the search sample
         AND the applied activation statistics; diagnostics report seen/used counts.
+        Distributed calibration currently requires None and reports global counts.
     :param on_degenerate: error if every candidate is nonfinite, or explicitly
         record an identity fallback. Nonfinite inputs/weights always fail.
 
@@ -95,11 +100,10 @@ class FlexSmoothModifier(Modifier):
             raise ValueError("Failed FlexSmooth model requires a fresh model")
 
     def _preflight(self, model):
-        if (
-            torch.distributed.is_initialized()
-            and torch.distributed.get_world_size() > 1
-        ):
-            raise ValueError("Distributed FlexSmooth is not supported")
+        if is_distributed() and self.max_tokens is not None:
+            raise ValueError(
+                "Distributed FlexSmooth currently requires max_tokens=None"
+            )
         with OffloadCache.disable_onloading():
             plan = glm_mappings(model, self.subgraphs)
             targets = {name for item in plan for name in item.targets}
@@ -161,11 +165,54 @@ class FlexSmoothModifier(Modifier):
         return plan
 
     def on_initialize(self, state: State, **kwargs) -> bool:
-        if getattr(state.model.config, "flex_smooth_config", None) is not None:
-            raise ValueError("Model already has FlexSmooth state; use a fresh model")
-        if state.loss_masks is not None:
-            raise ValueError("FlexSmooth loss masking is not supported")
-        self._plan = self._preflight(state.model)
+        error, signature = None, None
+        try:
+            if getattr(state.model.config, "flex_smooth_config", None) is not None:
+                raise ValueError(
+                    "Model already has FlexSmooth state; use a fresh model"
+                )
+            if state.loss_masks is not None:
+                raise ValueError("FlexSmooth loss masking is not supported")
+            self._plan = self._preflight(state.model)
+            if is_distributed():
+                targets = {name for item in self._plan for name in item.targets}
+                layout = []
+                with OffloadCache.disable_onloading():
+                    for name in sorted(targets):
+                        module = state.model.get_submodule(name)
+                        layout.append(
+                            (
+                                name,
+                                type(module._parameters).__name__,
+                                [
+                                    (key, tuple(value.shape), str(value.dtype))
+                                    for key in ("weight", "bias")
+                                    if (value := getattr(module, key, None)) is not None
+                                ],
+                            )
+                        )
+                signature = (
+                    self._plan,
+                    self.alpha,
+                    self.beta,
+                    self.max_tokens,
+                    self.on_degenerate,
+                    layout,
+                )
+        except Exception as caught:
+            error = caught
+        if is_distributed():
+            peers = [None] * dist.get_world_size()
+            dist.all_gather_object(peers, (str(error) if error else None, signature))
+            if any(message for message, _ in peers) or any(
+                other != signature for _, other in peers
+            ):
+                raise ValueError(
+                    "Invalid or inconsistent FlexSmooth initialization: "
+                    f"{[message for message, _ in peers]}"
+                ) from error
+        elif error is not None:
+            raise error
         self._model_ref = weakref.ref(state.model)
         return True
 
@@ -252,24 +299,46 @@ class FlexSmoothModifier(Modifier):
     def _smooth(self, model, item):
         first = model.get_submodule(item.consumers[0])
         device = get_execution_device(first)
-        weights = []
-        for name in item.consumers:
-            module = model.get_submodule(name)
-            with align_module_device(module, device):
-                weights.append(module.weight.detach().clone())
-        weight = torch.cat(weights, dim=0)
-        act = torch.cat(self._cache[item.source]).to(device=device, dtype=weight.dtype)
-        if not torch.isfinite(act).all():
-            raise ValueError(
-                f"{item.source}: nonfinite activations after dtype conversion"
+        error = None
+        try:
+            weights = []
+            for name in item.consumers:
+                module = model.get_submodule(name)
+                with align_module_device(module, device):
+                    weights.append(module.weight.detach())
+            weight = torch.cat(weights, dim=0)
+            cached = self._cache.get(item.source, [])
+            act = (
+                torch.cat(cached).to(device=device, dtype=weight.dtype)
+                if cached
+                else weight.new_empty((0, weight.shape[1]))
             )
-        if not torch.isfinite(weight).all():
-            raise ValueError(f"{item.source}: nonfinite weights")
+            if not torch.isfinite(act).all():
+                raise ValueError(
+                    f"{item.source}: nonfinite activations after dtype conversion"
+                )
+            if not torch.isfinite(weight).all():
+                raise ValueError(f"{item.source}: nonfinite weights")
+        except Exception as caught:
+            error = caught
+        finish_transform_phase(error, f"FlexSmooth preparation: {item.source}")
         alpha, beta = self.alpha, self.beta
         result, fallback = None, None
+        tokens_used = self._used.get(item.source, 0)
+        activation_max = (
+            act.abs().amax(0) if act.shape[0] else weight.new_zeros(weight.shape[1])
+        )
         if alpha is None or beta is None:
             try:
-                result = search_alpha_beta(act, weight)
+                if is_distributed():
+                    collective = search_alpha_beta_distributed(act, weight)
+                    result, activation_max = (
+                        collective.search,
+                        collective.activation_max,
+                    )
+                    tokens_used = sum(collective.tokens_per_rank)
+                else:
+                    result = search_alpha_beta(act, weight)
                 alpha, beta = result.alpha, result.beta
             except NoFiniteCandidateError:
                 if self.on_degenerate != "identity":
@@ -277,13 +346,19 @@ class FlexSmoothModifier(Modifier):
                 fallback = "no_finite_candidate"
                 alpha = beta = None
                 logger.warning(f"FlexSmooth identity fallback: {item.source}")
+        if is_distributed() and (result is None):
+            # Fixed alpha/beta and identity fallback still need global diagnostics.
+            dist.all_reduce(activation_max, op=dist.ReduceOp.MAX)
+            count = torch.tensor(tokens_used, device=device)
+            dist.all_reduce(count, op=dist.ReduceOp.SUM)
+            tokens_used = int(count.item())
         if fallback:
             scale = torch.ones(act.shape[1], device=device, dtype=weight.dtype)
         elif item.kind == "norm-linear":
-            scale = smooth_scale(act.abs().amax(0), weight.abs().amax(0), alpha, beta)
+            scale = smooth_scale(activation_max, weight.abs().amax(0), alpha, beta)
         else:
             scale, _ = ov_scales(
-                act.abs().amax(0),
+                activation_max,
                 weight.abs().amax(0),
                 alpha,
                 beta,
@@ -296,8 +371,8 @@ class FlexSmoothModifier(Modifier):
             "beta": beta,
             "loss": result.loss if result else None,
             "fallback": fallback,
-            "tokens_seen": self._seen[item.source],
-            "tokens_used": self._used[item.source],
+            "tokens_seen": tokens_used if is_distributed() else self._seen[item.source],
+            "tokens_used": tokens_used,
             "nonfinite_candidates": sum(
                 not math.isfinite(value)
                 for value in (*result.alpha_losses, *result.beta_losses)
@@ -308,7 +383,7 @@ class FlexSmoothModifier(Modifier):
         model.config.flex_smooth_config["results"][item.source] = details
         self._diagnostics[item.source] = {**details, "scale": scale.detach().cpu()}
         self._processed.add(item.source)
-        del self._cache[item.source]
+        self._cache.pop(item.source, None)
 
     def on_sequential_epoch_end(
         self, state: State, event: Event, modules=None, **kwargs
@@ -320,7 +395,9 @@ class FlexSmoothModifier(Modifier):
         members = set(model.modules() if modules is None else modules)
         try:
             for item in self._plan:
-                if item.source in self._processed or item.source not in self._cache:
+                if item.source in self._processed or (
+                    not is_distributed() and item.source not in self._cache
+                ):
                     continue
                 participants = {model.get_submodule(name) for name in item.targets}
                 if not participants & members:

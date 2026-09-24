@@ -7,8 +7,12 @@ from dataclasses import dataclass
 from typing import Literal
 
 import torch
+from compressed_tensors.distributed import is_distributed, is_source_process
 from compressed_tensors.offload import align_module_device, update_offload_parameter
+from compressed_tensors.offload.cache import DistributedCPUCache, DistributedDiskCache
 from torch import nn
+
+from llmcompressor.modifiers.transform.utils.distributed import finish_transform_phase
 
 
 @dataclass(frozen=True)
@@ -120,7 +124,35 @@ def glm_mappings(
 
 @torch.no_grad()
 def apply_scales(model: nn.Module, mapping: SmoothMapping, scale: torch.Tensor):
-    """Prepare one subgraph, validate finite results, then update actual CT caches."""
+    """Commit one mapping after every rank has finished reading its old weights.
+
+    Shared backing is written once. Other ranks copy their already computed
+    result into CT's current resident cache; no extra clone or backing read.
+    """
+    error, pending = None, []
+    try:
+        pending = _prepare_scale_updates(model, mapping, scale)
+    except Exception as caught:
+        error = caught
+    finish_transform_phase(error, f"FlexSmooth prepare scales: {mapping.source}")
+    error = None
+    try:
+        for module, name, value in pending:
+            cache = module._parameters
+            shared = isinstance(cache, (DistributedCPUCache, DistributedDiskCache))
+            if not is_distributed() or not shared or is_source_process():
+                update_offload_parameter(module, name, value)
+            else:
+                backing = cache.offloaded_values[name]
+                resident = cache.keep_onloaded_values.get(backing)
+                if resident is not None and resident is not backing:
+                    resident.copy_(value)
+    except Exception as caught:
+        error = caught
+    finish_transform_phase(error, f"FlexSmooth commit scales: {mapping.source}")
+
+
+def _prepare_scale_updates(model, mapping, scale):
     if not torch.isfinite(scale).all() or not (scale > 0).all():
         raise ValueError("FlexSmooth scales must be finite and positive")
     pending = []
@@ -149,5 +181,4 @@ def apply_scales(model: nn.Module, mapping: SmoothMapping, scale: torch.Tensor):
                 if not torch.isfinite(updated_bias).all():
                     raise ValueError(f"Nonfinite smoothed bias: {name}")
                 pending.append((module, "bias", updated_bias))
-    for module, name, value in pending:
-        update_offload_parameter(module, name, value)
+    return pending
