@@ -6,9 +6,77 @@
 from importlib import import_module
 
 import torch
+from torch.utils._pytree import tree_map
 
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform import FlexSmoothModifier, QuaRotModifier
+from llmcompressor.modifiers.transform.flex_smooth.mappings import glm_mappings
+from llmcompressor.utils.helpers import DisableQuantization, calibration_forward_context
+
+
+def inspect_fine_partitions(monkeypatch):
+    """Check the actual graph, including experts hidden by starred-call wrapping."""
+    pipeline = import_module("llmcompressor.pipelines.sequential.pipeline")
+    original = pipeline.trace_subgraphs
+    report = {}
+
+    def trace(model, sample_input, *args, **kwargs):
+        subgraphs = original(model, sample_input, *args, **kwargs)
+        names = {module: name for name, module in model.named_modules()}
+        members = [set(subgraph.submodules(model)) for subgraph in subgraphs]
+        for item in glm_mappings(model, ("norm-linear", "ov")):
+            participants = {model.get_submodule(name) for name in item.targets}
+            assert sum(participants <= group for group in members) == 1
+            assert sum(bool(participants & group) for group in members) == 1
+        # Two attention groups, dense/shared MLPs, two routed experts and a head.
+        assert len(subgraphs) == 7
+        expert_partitions = []
+        for index in range(2):
+            expert = model.get_submodule(f"model.layers.1.mlp.experts.{index}")
+            positions = [i for i, group in enumerate(members) if expert in group]
+            assert len(positions) == 1
+            expert_partitions.extend(positions)
+        assert len(set(expert_partitions)) == 2
+        for i in expert_partitions:
+            assert not any(".self_attn" in names[module] for module in members[i])
+
+        # Execute real traced subgraphs, not just the transformed full model.
+        with calibration_forward_context(model), DisableQuantization(model):
+            # The calibration context disables lm_head. Compare its real inputs.
+            hidden = []
+            handle = model.model.norm.register_forward_hook(
+                lambda module, args, output: hidden.append(output.detach().clone())
+            )
+            try:
+                model(**sample_input)
+                namespace = dict(sample_input)
+                for subgraph in subgraphs:
+                    # Model an accelerator roundtrip: inputs must not alias the
+                    # CPU cache. A CPU-only replay otherwise hides in-place bugs.
+                    inputs = tree_map(
+                        lambda value: value.clone()
+                        if isinstance(value, torch.Tensor)
+                        else value,
+                        {key: namespace[key] for key in subgraph.input_names},
+                    )
+                    output = subgraph.forward(model, **inputs)
+                    namespace.update(output)
+                    for key in subgraph.consumed_names:
+                        namespace.pop(key, None)
+            finally:
+                handle.remove()
+            assert len(hidden) == 2
+            torch.testing.assert_close(hidden[1], hidden[0], atol=0, rtol=0)
+        report.update(
+            subgraph_count=len(subgraphs),
+            modules=[sorted(names[module] for module in group) for group in members],
+            expert_partitions=expert_partitions,
+            replay_matches_full_forward=True,
+        )
+        return subgraphs
+
+    monkeypatch.setattr(pipeline, "trace_subgraphs", trace)
+    return report
 
 
 class OneshotTrace:

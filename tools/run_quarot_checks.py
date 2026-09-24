@@ -72,6 +72,9 @@ def main():
             [
                 "tests/flex_smooth",
                 "tests/llmcompressor/transformers/compression/test_resave_config.py",
+                "tests/llmcompressor/modeling/test_linear_experts.py",
+                "tests/llmcompressor/pipelines/sequential/test_ast_helpers.py",
+                "tests/llmcompressor/pipelines/sequential/ast_utils.py/test_auto_wrapper.py",
             ]
         )
         env.update(FLEXSMOOTH_REQUIRE_REFERENCE="1", FLEXSMOOTH_REPORT_DIR=str(output))
@@ -140,6 +143,18 @@ def main():
                             ).glob("*.py"),
                             *repo.joinpath("tests/flex_smooth").glob("*.py"),
                             repo / "examples/glm52_precision/mixed_mxfp.yaml",
+                            repo / "src/llmcompressor/modeling/moe/linear_experts.py",
+                            repo
+                            / "src/llmcompressor/pipelines/sequential"
+                            / "ast_utils/auto_wrapper.py",
+                            repo
+                            / "tests/llmcompressor/modeling/test_linear_experts.py",
+                            repo
+                            / "tests/llmcompressor/pipelines/sequential"
+                            / "test_ast_helpers.py",
+                            repo
+                            / "tests/llmcompressor/pipelines/sequential"
+                            / "ast_utils.py/test_auto_wrapper.py",
                             repo / "tools/glm52_precision_probe.py",
                             repo
                             / "src/llmcompressor/transformers/compression"

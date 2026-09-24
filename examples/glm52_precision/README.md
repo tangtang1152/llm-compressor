@@ -7,6 +7,11 @@ scale、中点舍入、小值策略和 BF16 边界差异；104 个 tensor 用例
 
 ## 本机已经验证的范围
 
+校准 oneshot 的细分区设置及验证范围见
+[sequential 分区说明](oneshot_partitions.md)。保持 input norm 与 attention 同段，
+逐专家分区；已验证仅路由 token 校准时未命中专家的权重量化与导出。
+DDP 接入仍未完成，当前不能直接启动八卡完整量化。
+
 `mixed_mxfp.yaml` 使用独立的 QuaRotModifier → FlexSmoothModifier →
 QuantizationModifier。官方 Transformers 随机 tiny GLM 的 basic / sequential
 两条管线验证目标分配、变换后的权重 scale、动态激活 Q/DQ、浮点等价性和清理。

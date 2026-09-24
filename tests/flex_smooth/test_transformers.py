@@ -33,11 +33,12 @@ from llmcompressor.modifiers.transform import FlexSmoothModifier, QuaRotModifier
 from llmcompressor.observers import MinMaxObserver
 from llmcompressor.recipe import Recipe
 from llmcompressor.utils.helpers import DisableQuantization
-from tests.flex_smooth.oneshot_trace import OneshotTrace
+from tests.flex_smooth.oneshot_trace import OneshotTrace, inspect_fine_partitions
 
 
 @pytest.mark.parametrize(
-    "pipeline", ["basic", "sequential", "default", "split-rejected"]
+    "pipeline",
+    ["basic", "sequential", "default", "split-rejected", "fine", "fine-routed"],
 )
 @pytest.mark.parametrize(
     "mixed,dtype",
@@ -80,6 +81,11 @@ def test_official_glm_calibration_export(tmp_path, monkeypatch, pipeline, mixed,
     for module in model.modules():
         if type(module).__name__.endswith("RMSNorm"):
             module.weight.copy_(torch.linspace(0.6, 1.4, module.weight.numel()))
+    if pipeline == "fine-routed":
+        # Force an unhit expert, whose weight scales/export must still be complete.
+        model.model.layers[1].mlp.gate.e_score_correction_bias.copy_(
+            torch.tensor([1000.0, -1000.0])
+        )
     config.dtype = dtype
     config.save_pretrained(tmp_path / "input-config")
     config._name_or_path = str(tmp_path / "input-config")
@@ -112,11 +118,18 @@ def test_official_glm_calibration_export(tmp_path, monkeypatch, pipeline, mixed,
     if pipeline == "split-rejected":
         pipeline_args = {"pipeline": "sequential", "sequential_targets_per_subgraph": 1}
         targets = ["GlmMoeDsaAttention", "ExpertMLP"]
+    if pipeline.startswith("fine"):
+        pipeline_args = {"pipeline": "sequential", "sequential_targets_per_subgraph": 1}
+        targets = [r"re:.*\.input_layernorm$", "ExpertMLP", "GlmMoeDsaMLP"]
+    partitions = (
+        inspect_fine_partitions(monkeypatch) if pipeline.startswith("fine") else None
+    )
     arguments = dict(
         model=model,
         processor=tokenizer,
         dataset=loader,
         recipe=recipe,
+        moe_calibrate_all_experts=pipeline != "fine-routed",
         sequential_targets=targets,
         **pipeline_args,
     )
@@ -128,7 +141,33 @@ def test_official_glm_calibration_export(tmp_path, monkeypatch, pipeline, mixed,
         assert model.config.flex_smooth_config["status"] == "failed"
         assert not modifier._hooks and not modifier._cache
         return
-    oneshot(**arguments)
+    expert_calls = {0: [], 1: []}
+    handles = []
+    if pipeline == "fine-routed":
+        # Linearize before registering hooks; oneshot uses these same experts.
+        from llmcompressor.modeling.moe.linearize import linearize_moe
+
+        linearize_moe(model)
+        for index in range(config.n_routed_experts):
+            expert = model.model.layers[1].mlp.experts[index]
+            handles.append(
+                expert.register_forward_pre_hook(
+                    lambda module, args, index=index: expert_calls[index].append(
+                        args[0].shape[0]
+                    )
+                    if isinstance(args[0], torch.Tensor)
+                    else None
+                )
+            )
+    try:
+        oneshot(**arguments)
+    finally:
+        for handle in handles:
+            handle.remove()
+    if pipeline == "fine-routed":
+        assert expert_calls[0] and max(expert_calls[0]) > 0
+        assert expert_calls[1] and set(expert_calls[1]) == {0}
+        partitions["expert_input_token_counts"] = expert_calls
     ordering = trace.verify(pipeline) if trace else None
     if mixed:
         _check_mixed_quantization(model, recipe[-1], f"{pipeline}-{dtype}")
@@ -152,6 +191,7 @@ def test_official_glm_calibration_export(tmp_path, monkeypatch, pipeline, mixed,
             dtype=str(dtype),
             float_transform_relative_l2=float_error.item(),
             event_ordering=ordering,
+            partitions=partitions,
         )
         if output := os.environ.get("FLEXSMOOTH_REPORT_DIR"):
             Path(output, f"compressed-{pipeline}-{dtype}.json").write_text(
