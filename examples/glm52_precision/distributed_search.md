@@ -1,9 +1,10 @@
 # Distributed FlexSmooth search: local validation
 
-`transform/flex_smooth/distributed.py` provides a collective search primitive.
-It is **not connected to the Modifier lifecycle yet**. QuaRot and FlexSmooth
-still reject multi-rank execution. This does not enable an eight-device oneshot
-run or establish Ascend backend compatibility.
+`transform/flex_smooth/distributed.py` provides the collective search used by
+FlexSmoothModifier with `max_tokens=None`. The shared CPU/disk two-rank sequential
+path now passes integration tests; see [the oneshot driver](oneshot_profile.md).
+The optional token-ID/cap primitive below remains independently tested, not wired
+to hooks. Local tests do not establish Ascend execution or real-model accuracy.
 
 All ranks supply replicated weights from the same snapshot and disjoint local
 activation rows. The primitive checks shapes/dtypes and input validity across
@@ -60,11 +61,7 @@ Reports include `collective-search-{1,2}-rank.json`, reference hashes, per-case
 loss differences, candidate grids and rank results. The communication test
 rejects non-integer all-gathers so raw activation gathering cannot slip in.
 
-Next integration requirements: synchronized shared CPU/disk offload writes and
-resident-cache refresh; identical weight snapshots; lifecycle-wide plan and
-token-ID agreement; then tiny multi-rank oneshot, actual Ascend collectives and
-server profiling. No real GLM weights are required for the local steps.
-
-Update: a [collective writeback primitive](distributed_offload.md) now also passes
-two-rank tests with real shared CT CPU/disk backing. Both primitives still need
-Modifier/global-token-ID integration and tiny multi-rank oneshot verification.
+The Modifier now agrees its plan at initialization and commits Flex mappings with
+one read-completion and one write-completion status reduction. It does not use the
+per-parameter [writeback prototype](distributed_offload.md). Global token caps are
+deferred; first server runs use small datasets and no cap.

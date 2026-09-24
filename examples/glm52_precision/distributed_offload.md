@@ -1,8 +1,10 @@
 # Collective transform writeback: local validation
 
 `transform/utils/distributed.py::update_transform_parameter` is a tested writeback
-primitive. It is **not yet connected to QuaRot or FlexSmooth**, whose multi-rank
-guards remain. This does not establish multi-rank oneshot or Ascend readiness.
+prototype, retained for its independent tests. It is **not used by QuaRot or
+FlexSmooth**: their integrated path instead uses source-only data-free QuaRot
+and mapping-level Flex commits. See [current oneshot semantics](oneshot_profile.md).
+The details below describe the earlier prototype, not the production hot path.
 
 The caller must compute an out-of-place result from the old parameter: modifying
 shared storage in place before calling this helper defeats its synchronization.
@@ -50,6 +52,6 @@ hashes. Run the standard `tools/run_quarot_checks.py --include-flex-smooth ...` 
 This first correctness implementation adds a result snapshot and three collectives
 per update. A non-writer's existing resident copy is reloaded from backing, which
 adds I/O. These costs have not been profiled on the server and must not be marketed
-as an eight-device speedup. Next: connect this protocol and collective search to
-Modifier error states and stable global token IDs, then validate tiny multi-rank
-oneshot before hardware collectives or real-model profiling.
+as an eight-device speedup. Those per-parameter costs were intentionally excluded
+from the integrated Modifier implementation; generic token-ID integration remains
+deferred until after the small uncapped smoke/profile.

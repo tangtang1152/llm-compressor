@@ -113,6 +113,7 @@ def main():
             "MXFP4/MXFP8 composition, FP32/BF16 compressed roundtrip with scoped GLM "
             "expert construction and explicit dtype normalization, cache-aligned "
             "CPU/disk offload, config persistence and header-only server fixtures; "
+            "two-rank shared CPU/disk sequential oneshot and compressed reload; "
             "NOT generic loader compatibility, server kernels, KV-cache or real L4"
             if args.include_flex_smooth
             else ""
@@ -143,6 +144,7 @@ def main():
                             ).glob("*.py"),
                             *repo.joinpath("tests/flex_smooth").glob("*.py"),
                             repo / "examples/glm52_precision/mixed_mxfp.yaml",
+                            repo / "examples/glm52_precision/oneshot_profile.py",
                             repo / "src/llmcompressor/modeling/moe/linear_experts.py",
                             repo
                             / "src/llmcompressor/modifiers/transform/utils"

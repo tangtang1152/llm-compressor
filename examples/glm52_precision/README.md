@@ -10,7 +10,16 @@ scale、中点舍入、小值策略和 BF16 边界差异；104 个 tensor 用例
 校准 oneshot 的细分区设置及验证范围见
 [sequential 分区说明](oneshot_partitions.md)。保持 input norm 与 attention 同段，
 逐专家分区；已验证仅路由 token 校准时未命中专家的权重量化与导出。
-DDP 接入仍未完成，当前不能直接启动八卡完整量化。
+DDP Modifier 接入及 CPU/disk 两 rank tiny E2E 已完成；先运行下面的单进程
+服务器 smoke/profile，再根据结果推进多 rank，尚未验证八卡完整量化。
+
+## L5 calibrated oneshot/profile
+
+The single-process and distributed smoke driver is
+[`oneshot_profile.py`](oneshot_profile.py). Read the
+[run instructions, measurements and validation limits](oneshot_profile.md).
+The distributed Modifier path now uses shared-backing QuaRot and mapping-level
+Flex commits; global token caps remain deferred (`max_tokens=None` for smoke).
 
 `mixed_mxfp.yaml` 使用独立的 QuaRotModifier → FlexSmoothModifier →
 QuantizationModifier。官方 Transformers 随机 tiny GLM 的 basic / sequential

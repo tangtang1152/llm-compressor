@@ -55,14 +55,13 @@ experts; this does not establish proportional weight-I/O savings. Do not reuse
 the setting for other recipes needing expert activation statistics without
 separate validation.
 
-Remaining multi-device work: global FlexSmooth statistics/search reductions,
-global token-budget semantics, coordinated shared offload writes and the actual
-Ascend collective backend. Distributed Modifier guards remain enabled. QuaRot
+The uncapped distributed Modifier path now passes tiny two-rank sequential tests
+with real shared CPU/disk backing and compressed reload. Global token caps remain
+deferred, and NPU/full-model profiling is a server task. QuaRot
 still runs its full weight traversal at calibration start; these partition
 settings do not make rotation layer-streamed. Use explicit QuaRot FP32 for the
 future server comparison to the FP32 L4 reference, and record BF16 storage
 rounding separately. MTP preservation/export also remains a server prerequisite.
 
-Update: the [collective search primitive](distributed_search.md) now passes local
-single/two-rank source differential tests. It is not yet connected to the
-Modifier; global token IDs and synchronized offload writes remain prerequisites.
+See the [collective search](distributed_search.md) for source comparisons and the
+[oneshot profile driver](oneshot_profile.md) for the integrated execution path.
