@@ -145,6 +145,9 @@ def main():
                             repo / "examples/glm52_precision/mixed_mxfp.yaml",
                             repo / "src/llmcompressor/modeling/moe/linear_experts.py",
                             repo
+                            / "src/llmcompressor/modifiers/transform/utils"
+                            / "distributed.py",
+                            repo
                             / "src/llmcompressor/pipelines/sequential"
                             / "ast_utils/auto_wrapper.py",
                             repo

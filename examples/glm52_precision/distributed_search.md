@@ -64,3 +64,7 @@ Next integration requirements: synchronized shared CPU/disk offload writes and
 resident-cache refresh; identical weight snapshots; lifecycle-wide plan and
 token-ID agreement; then tiny multi-rank oneshot, actual Ascend collectives and
 server profiling. No real GLM weights are required for the local steps.
+
+Update: a [collective writeback primitive](distributed_offload.md) now also passes
+two-rank tests with real shared CT CPU/disk backing. Both primitives still need
+Modifier/global-token-ID integration and tiny multi-rank oneshot verification.
