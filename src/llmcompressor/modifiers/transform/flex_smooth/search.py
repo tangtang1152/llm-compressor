@@ -4,6 +4,7 @@
 """Independent two-coordinate search and scale geometry for FlexSmooth."""
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -63,15 +64,20 @@ def search_alpha_beta(activations: torch.Tensor, weights: torch.Tensor) -> Searc
         or not weights.numel()
     ):
         raise ValueError("FlexSmooth requires nonempty 2D activations and weights")
+    return _search_candidates(
+        lambda alpha, beta: reconstruction_loss(activations, weights, alpha, beta)
+    )
+
+
+def _search_candidates(evaluate: Callable[[float, float], float]) -> SearchResult:
+    """Shared coordinate order and tie policy for local and reduced losses."""
     grid = tuple(round(index / 20, 2) for index in range(21))
-    first = tuple(reconstruction_loss(activations, weights, a, 1.0 - a) for a in grid)
+    first = tuple(evaluate(a, 1.0 - a) for a in grid)
     best_loss, best_alpha = math.inf, 0.0
     for alpha, loss in zip(grid, first):
         if math.isfinite(loss) and loss <= best_loss:
             best_loss, best_alpha = loss, alpha
-    second = tuple(
-        reconstruction_loss(activations, weights, best_alpha, b) for b in grid
-    )
+    second = tuple(evaluate(best_alpha, b) for b in grid)
     # The beta-stage threshold is the first-stage optimum, not infinity.
     best_beta = 0.0
     for beta, loss in zip(grid, second):

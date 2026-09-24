@@ -62,3 +62,7 @@ still runs its full weight traversal at calibration start; these partition
 settings do not make rotation layer-streamed. Use explicit QuaRot FP32 for the
 future server comparison to the FP32 L4 reference, and record BF16 storage
 rounding separately. MTP preservation/export also remains a server prerequisite.
+
+Update: the [collective search primitive](distributed_search.md) now passes local
+single/two-rank source differential tests. It is not yet connected to the
+Modifier; global token IDs and synchronized offload writes remain prerequisites.
