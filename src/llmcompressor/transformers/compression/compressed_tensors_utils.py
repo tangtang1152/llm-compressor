@@ -11,6 +11,7 @@ from compressed_tensors import ModelCompressor, SparsityCompressionConfig
 from compressed_tensors.config import CompressionFormat
 from compressed_tensors.distributed import is_source_process
 from compressed_tensors.offload import OffloadCache, from_accelerate, to_accelerate
+from compressed_tensors.offload.cache import DiskCache
 from compressed_tensors.utils import deprecated, save_mtp_tensors_to_checkpoint
 from huggingface_hub import hf_hub_download
 from loguru import logger
@@ -151,6 +152,19 @@ def modify_save_pretrained(model: PreTrainedModel):
             # tied-parameter bookkeeping consistent.
             _retie_embeddings(model)
 
+            # CT's accelerate disk index is built from state_dict, which omits
+            # nonpersistent buffers (e.g. GLM rotary inv_freq). Retain those small
+            # runtime buffers on the source so conversion back cannot strand them
+            # on meta after saving. Parameters stay offloaded throughout.
+            runtime_buffers = []
+            if is_source_process():
+                for module in model.modules():
+                    if isinstance(module._buffers, DiskCache):
+                        for name in module._non_persistent_buffers_set:
+                            value = getattr(module, name, None)
+                            if value is not None:
+                                runtime_buffers.append((module, name, value.cpu()))
+
             # convert to accelerate offloaded for optimal saving with transformers
             to_accelerate(model)
 
@@ -180,6 +194,8 @@ def modify_save_pretrained(model: PreTrainedModel):
                         save_mtp_tensors_to_checkpoint(model.name_or_path, save_dir)
 
             # convert back from accelerate to restore model to original form
+            for module, name, value in runtime_buffers:
+                module._buffers[name] = value
             from_accelerate(model)
 
         save_pretrained_wrapper._overridden = True
