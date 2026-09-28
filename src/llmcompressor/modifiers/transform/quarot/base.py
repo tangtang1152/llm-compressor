@@ -5,6 +5,7 @@
 
 import weakref
 from collections import defaultdict
+from time import perf_counter
 
 import torch
 import torch.distributed as dist
@@ -17,6 +18,7 @@ from compressed_tensors.offload import (
 )
 from compressed_tensors.offload.cache import DistributedCPUCache, DistributedDiskCache
 from compressed_tensors.utils import TorchDtype
+from loguru import logger
 from pydantic import Field, PrivateAttr, field_validator
 
 from llmcompressor.core import Event, State
@@ -29,6 +31,42 @@ from .mappings import RotationPlan, WeightRotation, build_glm_plan
 from .rotation import HadamardRotation, make_hadamard_rotation, rotate_axis
 
 __all__ = ["QuaRotModifier"]
+
+
+class _QuaRotProgress:
+    """Low-frequency host wall-time progress, counted after each yielded job.
+
+    No accelerator synchronization is added. Timings include host work and
+    blocking transfers, but are not synchronized device-kernel measurements.
+    """
+
+    def __init__(self, phase: str, total: int):
+        self.phase, self.total = phase, total
+        self.completed = 0
+        self.interval = max(1, (total + 19) // 20)
+        self.started = perf_counter()
+        logger.info("[QuaRot] {} 0/{} | elapsed=0.00 s", phase, total)
+
+    def track(self, items):
+        for item in items:
+            yield item
+            # Resumption means the caller finished the previous consumer/op.
+            self.completed += 1
+            if self.completed % self.interval == 0 or self.completed == self.total:
+                logger.info(
+                    "[QuaRot] {} {}/{} | elapsed={:.2f} s",
+                    self.phase,
+                    self.completed,
+                    self.total,
+                    perf_counter() - self.started,
+                )
+
+    def complete(self):
+        logger.info(
+            "[QuaRot] {} complete: {:.2f} s",
+            self.phase,
+            perf_counter() - self.started,
+        )
 
 
 class QuaRotModifier(Modifier):
@@ -253,6 +291,10 @@ class QuaRotModifier(Modifier):
             raise ValueError("QuaRot lifecycle model changed after initialization")
         if self._applied:
             return
+        started = perf_counter()
+        report_progress = not is_distributed() or is_source_process()
+        if report_progress:
+            logger.info("[QuaRot] preparation / validation started (host wall time)")
         error = None
         try:
             if self._validate_model(model) != self._plan:
@@ -293,17 +335,35 @@ class QuaRotModifier(Modifier):
         model.config.quarot_config = metadata
         try:
             finish_transform_phase(error, "QuaRot preparation")
+            if report_progress:
+                logger.info(
+                    "[QuaRot] preparation / validation complete: {:.2f} s",
+                    perf_counter() - started,
+                )
             error = None
             try:
                 if not is_distributed() or is_source_process():
+                    fusion_progress = _QuaRotProgress(
+                        "norm fusion",
+                        sum(len(fusion.consumers) for fusion in self._plan.fusions),
+                    )
                     for fusion in self._plan.fusions:
                         fuse_norm_linears(
                             model.get_submodule(fusion.norm),
-                            [model.get_submodule(name) for name in fusion.consumers],
+                            fusion_progress.track(
+                                [model.get_submodule(name) for name in fusion.consumers]
+                            ),
                             precision=self.precision,
                         )
-                    for operation in (self._plan.embedding, *self._plan.rotations):
+                    fusion_progress.complete()
+                    rotation_progress = _QuaRotProgress(
+                        "rotation", 1 + len(self._plan.rotations)
+                    )
+                    for operation in rotation_progress.track(
+                        (self._plan.embedding, *self._plan.rotations)
+                    ):
                         self._rotate(model, operation)
+                    rotation_progress.complete()
             except Exception as caught:
                 error = caught
             finish_transform_phase(error, "QuaRot transform")
@@ -316,6 +376,8 @@ class QuaRotModifier(Modifier):
         metadata["status"] = "applied"
         self._applied = True
         self._matrices.clear()
+        if report_progress:
+            logger.info("[QuaRot] total complete: {:.2f} s", perf_counter() - started)
 
     def on_finalize(self, state: State, **kwargs) -> bool:
         self._matrices.clear()
