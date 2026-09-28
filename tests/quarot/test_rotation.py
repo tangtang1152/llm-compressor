@@ -21,12 +21,17 @@ def test_orthogonality_and_rng_isolation(size, block, shifted):
         size, block_size=block, shifted=shifted, dtype=torch.float64
     )
     torch.testing.assert_close(
-        q.T @ q, torch.eye(size, dtype=q.dtype), atol=1e-12, rtol=1e-12
+        q.to_dense().T @ q.to_dense(),
+        torch.eye(size, dtype=q.block.dtype),
+        atol=1e-12,
+        rtol=1e-12,
     )
     assert torch.equal(before, torch.random.get_rng_state())
     assert torch.equal(
-        q,
-        make_hadamard_rotation(size, block_size=block, shifted=shifted, dtype=q.dtype),
+        q.to_dense(),
+        make_hadamard_rotation(
+            size, block_size=block, shifted=shifted, dtype=q.block.dtype
+        ).to_dense(),
     )
 
 
@@ -59,7 +64,7 @@ def test_repeated_segment_matches_explicit_matrix(axis):
     value = torch.randn(40, 40, generator=gen, dtype=torch.float64)
     before = value.clone()
     q = make_hadamard_rotation(8, dtype=torch.float64)
-    block = torch.block_diag(torch.eye(2, dtype=q.dtype), q)
+    block = torch.block_diag(torch.eye(2, dtype=q.block.dtype), q.to_dense())
     full = torch.block_diag(*[block] * 4)
     expected = full.T @ value if axis == 0 else value @ full
     actual = rotate_axis(value, q, axis=axis, stride=10, offset=2)
@@ -75,7 +80,7 @@ def test_repeated_segment_matches_explicit_matrix(axis):
 def test_noncontiguous_roundtrip():
     value = torch.arange(256, dtype=torch.float64).view(16, 16).T
     q = make_hadamard_rotation(8, dtype=torch.float64)
-    result = rotate_axis(rotate_axis(value, q, axis=0), q.T, axis=0)
+    result = rotate_axis(rotate_axis(value, q, axis=0), q.to_dense().T, axis=0)
     torch.testing.assert_close(result, value, atol=1e-12, rtol=1e-12)
 
 
@@ -99,7 +104,7 @@ def test_rotation_uses_unbatched_gemm(shape, axis, stride, offset):
     original = value.clone()
     rotation = make_hadamard_rotation(32, dtype=torch.float64)
     block = torch.eye(stride, dtype=torch.float64)
-    block[offset : offset + 32, offset : offset + 32] = rotation
+    block[offset : offset + 32, offset : offset + 32] = rotation.to_dense()
     full = torch.block_diag(*[block] * (shape[axis] // stride))
     expected = torch.einsum("...j,jk->...k", value.movedim(axis, -1), full)
     expected = expected.movedim(-1, axis)

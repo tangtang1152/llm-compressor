@@ -509,7 +509,7 @@ def reference_rotate(oracle, weight, rotation, axis, stride=None, offset=0):
 @torch.no_grad()
 def check_quarot(weights, config, inputs, oracle, seed, block):
     h, q, c, _, k, r, v = (config[key] for key in DIMENSIONS)
-    matrices, checks = {}, {}
+    matrices, rotations, checks = {}, {}, {}
     for name, size, shifted in (
         ("H", h, False),
         ("A", q, True),
@@ -517,9 +517,12 @@ def check_quarot(weights, config, inputs, oracle, seed, block):
         ("V", v, False),
     ):
         print(f"QuaRot matrix: {name} ({size})", flush=True)
-        matrix = make_hadamard_rotation(
+        rotation = make_hadamard_rotation(
             size, block_size=block, shifted=shifted, seed=seed
         )
+        # Dense materialization is reference-only; weights use the structured path.
+        matrix = rotation.to_dense()
+        rotations[name] = rotation
         mode = (
             oracle.utils.QuaRotMode.BLOCK_HADAMARD_SHIFTED
             if shifted
@@ -576,7 +579,7 @@ def check_quarot(weights, config, inputs, oracle, seed, block):
         module.weight = nn.Parameter(
             rotate_axis(
                 module.weight,
-                matrices[space],
+                rotations[space],
                 axis=axis,
                 stride=stride,
                 offset=offset,

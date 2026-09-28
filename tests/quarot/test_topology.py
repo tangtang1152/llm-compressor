@@ -110,12 +110,15 @@ def test_complete_tiny_float_invariance(dtype, atol, rtol, q_rank):
                 )
         torch.testing.assert_close(
             right["hidden"],
-            left["hidden"] @ matrices["rot"].to(dtype),
+            left["hidden"] @ matrices["rot"].to_dense().to(dtype),
             atol=atol,
             rtol=rtol,
         )
         torch.testing.assert_close(
-            right["v"], left["v"] @ matrices["rot_uv"].to(dtype), atol=atol, rtol=rtol
+            right["v"],
+            left["v"] @ matrices["rot_uv"].to_dense().to(dtype),
+            atol=atol,
+            rtol=rtol,
         )
 
 

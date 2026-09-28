@@ -26,7 +26,7 @@ from llmcompressor.modifiers.transform.utils.distributed import finish_transform
 from llmcompressor.utils import get_high_precision, untie_word_embeddings
 
 from .mappings import RotationPlan, WeightRotation, build_glm_plan
-from .rotation import make_hadamard_rotation, rotate_axis
+from .rotation import HadamardRotation, make_hadamard_rotation, rotate_axis
 
 __all__ = ["QuaRotModifier"]
 
@@ -58,7 +58,7 @@ class QuaRotModifier(Modifier):
     precision: TorchDtype = Field(default=get_high_precision())
 
     _plan: RotationPlan | None = PrivateAttr(default=None)
-    _matrices: dict[str, torch.Tensor] = PrivateAttr(default_factory=dict)
+    _matrices: dict[str, HadamardRotation] = PrivateAttr(default_factory=dict)
     _model_ref: weakref.ReferenceType | None = PrivateAttr(default=None)
     _applied: bool = PrivateAttr(default=False)
 

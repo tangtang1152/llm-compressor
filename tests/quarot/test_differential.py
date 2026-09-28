@@ -92,7 +92,7 @@ def test_rotation_matrices_match_reference(oracle, size, block, shifted, seed):
     ours = make_hadamard_rotation(
         size, block_size=None if block == -1 else block, shifted=shifted, seed=seed
     )
-    torch.testing.assert_close(ours, reference, atol=0, rtol=0)
+    torch.testing.assert_close(ours.to_dense(), reference, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(
@@ -131,7 +131,7 @@ def test_all_stages_match_modelslim(oracle, q_rank, dtype, block_size):
     )
     for name in matrices:
         torch.testing.assert_close(
-            matrices[name], expected_matrices[name], atol=0, rtol=0
+            matrices[name].to_dense(), expected_matrices[name], atol=0, rtol=0
         )
     report = {
         "fixture_seed": 42,
