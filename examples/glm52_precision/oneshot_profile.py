@@ -251,6 +251,30 @@ def quantized_tiles(model, *, dequantized=False):
     return tiles
 
 
+def prepare_generation_config(model, report):
+    """Unset inactive GLM sampling metadata, recording the original value."""
+    config = model.generation_config
+    details = {"adjustments": [], "load_validation": "pending"}
+    report["generation_config"] = details
+    if config.do_sample is False and config.top_p not in (None, 1.0):
+        details["adjustments"].append(
+            {
+                "field": "top_p",
+                "original": config.top_p,
+                "value": None,
+                "action": "unset_non_sampling_top_p",
+                "do_sample": config.do_sample,
+            }
+        )
+        config.top_p = None
+    try:
+        config.validate(strict=True)
+    except ValueError:
+        details["load_validation"] = "failed"
+        raise
+    details["load_validation"] = "passed"
+
+
 def main():
     args = parse_args()
     world_size, rank = (
@@ -331,6 +355,7 @@ def main():
             model = AutoModelForCausalLM.from_pretrained(
                 str(args.model), **loading_args
             ).eval()
+        prepare_generation_config(model, profile.report)
         tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
         with profile.stage("dataset"):
             loader, tokens = calibration_data(args, tokenizer)
@@ -362,6 +387,9 @@ def main():
         if dist.is_initialized():
             dist.barrier()  # Finish the source's reads before any rank compresses.
         with profile.stage("save"):
+            # Match GenerationConfig.save_pretrained before expensive compression.
+            model.generation_config.validate(strict=True)
+            profile.report["generation_config"]["pre_save_validation"] = "passed"
             model.save_pretrained(args.output, save_compressed=True)
             if rank == 0:
                 tokenizer.save_pretrained(args.output)

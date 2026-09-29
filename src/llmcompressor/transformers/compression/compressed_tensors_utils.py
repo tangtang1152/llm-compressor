@@ -133,6 +133,11 @@ def modify_save_pretrained(model: PreTrainedModel):
             save_dir = save_directory
             kwargs.setdefault("max_shard_size", "20GB")
 
+            # Transformers validates this strictly when saving. Fail before any
+            # compression or offload conversion, without modifying user settings.
+            if model.can_generate():
+                model.generation_config.validate(strict=True)
+
             # without this, quantization format will be inferred from the model
             if not save_compressed and quantization_format is None:
                 quantization_format = CompressionFormat.dense.value
