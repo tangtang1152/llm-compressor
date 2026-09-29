@@ -38,6 +38,7 @@ from llmcompressor.modeling.moe.linearize import linearize_moe
 from llmcompressor.modifiers.transform import FlexSmoothModifier, QuaRotModifier
 from llmcompressor.modifiers.transform.flex_smooth import base as flex_base
 from llmcompressor.modifiers.utils.hooks import HooksMixin
+from llmcompressor.pipelines.sequential import pipeline as sequential_pipeline
 from llmcompressor.pipelines.sequential.helpers import Subgraph
 from llmcompressor.recipe import Recipe
 from tests.flex_smooth.compression_trace import CompressionTrace, state_signature
@@ -86,17 +87,29 @@ def _run(model, tokenizer, loader):
     ).modifiers
     recipe[0].precision = torch.float32
     recipe[1].max_tokens = None
-    oneshot(
-        model=model,
-        processor=tokenizer,
-        dataset=loader,
-        recipe=recipe,
-        pipeline="sequential",
-        sequential_targets_per_subgraph=1,
-        sequential_targets=[r"re:.*\.input_layernorm$", "ExpertMLP", "GlmMoeDsaMLP"],
-        propagate_error=True,
-        moe_calibrate_all_experts=False,
-    )
+    # SequentialPipeline overwrites the model's onload device using host detection;
+    # sequential_offload_device only controls activation backing. Pin this test's
+    # pipeline lookup (also in spawned workers), leaving global detection untouched.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            sequential_pipeline, "get_main_device", lambda: torch.device("cpu")
+        )
+        oneshot(
+            model=model,
+            processor=tokenizer,
+            dataset=loader,
+            recipe=recipe,
+            pipeline="sequential",
+            sequential_offload_device="cpu",
+            sequential_targets_per_subgraph=1,
+            sequential_targets=[
+                r"re:.*\.input_layernorm$",
+                "ExpertMLP",
+                "GlmMoeDsaMLP",
+            ],
+            propagate_error=True,
+            moe_calibrate_all_experts=False,
+        )
     return recipe[1].diagnostics
 
 
@@ -126,6 +139,7 @@ def _worker(rank, store, directory, kind):
         world_size=2,
         timeout=timedelta(seconds=60),
     )
+    assert dist.get_backend() == "gloo"
     model, tokenizer = _fixture(directory)
     for module in model.modules():
         remove_module_offload(module, onload_tensors=True)
@@ -223,6 +237,9 @@ def _worker(rank, store, directory, kind):
         search = flex_base.search_alpha_beta_distributed
 
         def record_search(activations, weights, **kwargs):
+            assert dist.get_backend() == "gloo"
+            assert activations.device.type == "cpu", activations.device
+            assert weights.device.type == "cpu", weights.device
             local = activations.abs().amax(0).cpu()
             peer_maxima = [None, None]
             dist.all_gather_object(peer_maxima, local)
@@ -317,6 +334,8 @@ def _worker(rank, store, directory, kind):
     report = {
         "rank": rank,
         "backing": kind,
+        "search_device": "cpu",
+        "backend": "gloo",
         "real_weights": False,
         "rotation_calls": len(rotation_calls),
         "events": trace.events,

@@ -14,6 +14,8 @@ import torch
 
 from examples.glm52_precision import oneshot_profile as driver
 from llmcompressor.modifiers.transform import FlexSmoothModifier, QuaRotModifier
+from llmcompressor.pipelines.sequential import pipeline as sequential_pipeline
+from llmcompressor.utils import dev
 from tests.flex_smooth.test_distributed_oneshot import _config, _fixture, _run
 
 
@@ -45,7 +47,9 @@ def _args(path, batch_size=1):
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
 @pytest.mark.parametrize("side", ["left", "right"])
 @torch.no_grad()
-def test_variable_length_batches_reach_sequential(tmp_path, batch_size, side):
+def test_variable_length_batches_reach_sequential(
+    tmp_path, monkeypatch, batch_size, side
+):
     _config(tmp_path)
     model, tokenizer = _fixture(tmp_path)
     tokenizer.padding_side = side
@@ -76,8 +80,16 @@ def test_variable_length_batches_reach_sequential(tmp_path, batch_size, side):
     assert report["sequence_length_min"] == 1
     assert report["sequence_length_max"] == 5
     assert report["batches_local"] == (3 + batch_size - 1) // batch_size
+    # A CPU-only host must also catch accidental reliance on auto-detection.
+    # Only the pipeline's imported lookup is replaced; global detection stays real.
+    host_selector = Mock(side_effect=AssertionError("Host device selection escaped"))
+    global_selector = dev.get_main_device
+    monkeypatch.setattr(sequential_pipeline, "get_main_device", host_selector)
     with driver.Profile("cpu").instrument():
         diagnostics = _run(model, tokenizer, loader)
+    host_selector.assert_not_called()
+    assert sequential_pipeline.get_main_device is host_selector
+    assert dev.get_main_device is global_selector
     assert len(diagnostics) == 6  # Real three-Modifier sequential lifecycle completed.
 
 
