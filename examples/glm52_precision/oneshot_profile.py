@@ -27,9 +27,15 @@ from compressed_tensors.offload import align_module_device
 from compressed_tensors.offload.cache import CPUCache, DiskCache
 from compressed_tensors.quantization.lifecycle.forward import fake_quantize
 from compressed_tensors.utils import patch_attr
-from datasets import load_dataset
+from datasets import Dataset, ReadInstruction, load_dataset
+from loguru import logger
 from torch.utils.data import DataLoader
-from transformers import AutoModelForCausalLM, AutoTokenizer, CompressedTensorsConfig
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    CompressedTensorsConfig,
+    DataCollatorWithPadding,
+)
 
 from llmcompressor import oneshot
 from llmcompressor.core import reset_session
@@ -175,8 +181,8 @@ def parse_args():
     parser.add_argument("--report-dir", type=Path)
     parser.add_argument(
         "--dataset",
-        default="HuggingFaceH4/ultrachat_200k",
-        help="HF dataset or local JSON/JSONL",
+        required=True,
+        help="Explicit HF dataset or local JSON list[str]/JSONL text/messages",
     )
     parser.add_argument("--split", default="train_sft")
     parser.add_argument(
@@ -186,17 +192,45 @@ def parse_args():
         help="Global sample count; at least world_size",
     )
     parser.add_argument("--sequence-length", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--targets-per-subgraph", type=int, default=1)
     return parser.parse_args()
 
 
-def calibration_data(args, tokenizer):
-    if Path(args.dataset).is_file():
-        dataset = load_dataset(
-            "json",
-            data_files=args.dataset,
-            split=get_rank_partition("train", args.samples),
+def resolve_device_map(device_map, world_size):
+    device_map = device_map or ("auto_offload" if world_size > 1 else "auto")
+    if device_map not in ("auto", "auto_offload") or (
+        world_size > 1 and device_map != "auto_offload"
+    ):
+        raise ValueError(
+            "Distributed smoke uses CT auto_offload; auto is single-process only"
         )
+    return device_map
+
+
+def calibration_data(args, tokenizer):
+    """Tokenize this rank's upstream partition and exercise every padded batch."""
+    if Path(args.dataset).is_file():
+        # ModelSlim's calibration JSON is a top-level list of prompt strings.
+        with Path(args.dataset).open(encoding="utf-8") as source:
+            contents = source.read()
+        if contents.lstrip().startswith("["):
+            rows = json.loads(contents)
+            if not rows or not all(isinstance(row, str) for row in rows):
+                raise ValueError("Calibration JSON array must be a nonempty list[str]")
+            dataset = Dataset.from_dict({"text": rows})
+            partition = ReadInstruction.from_spec(
+                get_rank_partition("train", args.samples)
+            ).to_absolute({"train": len(dataset)})[0]
+            dataset = dataset.select(
+                range(partition.from_ or 0, partition.to or len(dataset))
+            )
+        else:
+            dataset = load_dataset(
+                "json",
+                data_files=args.dataset,
+                split=get_rank_partition("train", args.samples),
+            )
     else:
         dataset = load_dataset(
             args.dataset, split=get_rank_partition(args.split, args.samples)
@@ -204,10 +238,12 @@ def calibration_data(args, tokenizer):
 
     def tokenize(row):
         text = row.get("text")
-        if text is None:
+        if text is None and "messages" in row:
             text = tokenizer.apply_chat_template(
                 row["messages"], tokenize=False, add_generation_prompt=False
             )
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("Each calibration row needs nonempty text or messages")
         return tokenizer(
             text,
             truncation=True,
@@ -219,9 +255,78 @@ def calibration_data(args, tokenizer):
     dataset = dataset.map(tokenize, remove_columns=dataset.column_names)
     if not len(dataset) or any(not row["input_ids"] for row in dataset):
         raise ValueError("Each rank needs nonempty calibration samples")
-    token_count = sum(len(row["input_ids"]) for row in dataset)
-    dataset.set_format("torch")
-    return DataLoader(dataset, batch_size=1), token_count
+    lengths = [sum(row["attention_mask"]) for row in dataset]
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        collate_fn=DataCollatorWithPadding(tokenizer, return_tensors="pt"),
+    )
+    # Materialize batches now, before transforms, without retaining a second cache.
+    samples, tokens = 0, 0
+    for batch in loader:
+        ids, mask = batch["input_ids"], batch["attention_mask"]
+        if ids.ndim != 2 or ids.shape != mask.shape:
+            raise ValueError("Calibration requires matching [batch, tokens] IDs/masks")
+        samples += ids.shape[0]
+        tokens += int(mask.sum())
+    if samples != len(dataset) or tokens != sum(lengths):
+        raise ValueError("Calibration collation changed sample/valid-token counts")
+    requested = ReadInstruction.from_spec(
+        get_rank_partition("train", args.samples)
+    ).to_absolute({"train": args.samples})[0]
+    return loader, {
+        "partition": get_rank_partition("train", args.samples),
+        "samples_expected": (requested.to or args.samples) - (requested.from_ or 0),
+        "samples_local": samples,
+        "batches_local": len(loader),
+        "tokens_local_valid": tokens,
+        "sequence_length_min": min(lengths),
+        "sequence_length_max": max(lengths),
+    }
+
+
+def calibration_preflight(args, tokenizer, model, flex, report):
+    """Finish local checks on every rank, then agree on the dataset contract."""
+    loader, stats, error = None, None, None
+    try:
+        prepare_generation_config(model, report)
+        flex._preflight(model)  # Reuse the Modifier's existing cap/layout checks.
+        loader, stats = calibration_data(args, tokenizer)
+    except Exception as caught:
+        error = repr(caught)
+    peers = [{"error": error, "stats": stats}]
+    if dist.is_initialized():
+        peers = [None] * dist.get_world_size()
+        dist.all_gather_object(peers, {"error": error, "stats": stats})
+    if any(peer["error"] is not None for peer in peers):
+        raise ValueError(f"Calibration preflight failed: {peers}")
+    counts = [peer["stats"]["samples_local"] for peer in peers]
+    expected = [peer["stats"]["samples_expected"] for peer in peers]
+    if counts != expected or sum(counts) != args.samples:
+        raise ValueError(f"Calibration partition counts {counts}, expected {expected}")
+    total_tokens = sum(peer["stats"]["tokens_local_valid"] for peer in peers)
+    report.update(
+        **stats,
+        samples_global=sum(counts),
+        tokens_global_valid=total_tokens,
+        sequence_length_mean=total_tokens / sum(counts),
+        batch_size=args.batch_size,
+        dataset_source=str(args.dataset),
+        flex_max_tokens=flex.max_tokens,
+        preflight="passed",
+    )
+    for key in ("sequence_length_min", "sequence_length_max"):
+        operation = min if key.endswith("min") else max
+        report[key] = operation(peer["stats"][key] for peer in peers)
+    logger.info(
+        "Calibration preflight: {}",
+        {
+            key: value
+            for key, value in report.items()
+            if key not in ("stages", "cache_io", "versions", "generation_config")
+        },
+    )
+    return loader
 
 
 @torch.no_grad()
@@ -287,6 +392,7 @@ def main():
         args.samples < world_size
         or args.sequence_length <= 0
         or args.targets_per_subgraph <= 0
+        or args.batch_size <= 0
     ):
         raise ValueError(
             "Use positive lengths/partition size and at least one sample per rank"
@@ -295,11 +401,7 @@ def main():
         raise ValueError(
             "Use a new output directory; existing checkpoints are not overwritten"
         )
-    device_map = args.device_map or ("auto_offload" if world_size > 1 else "auto")
-    if world_size > 1 and device_map != "auto_offload":
-        raise ValueError(
-            "Distributed smoke uses CT auto_offload; auto is single-process only"
-        )
+    device_map = resolve_device_map(args.device_map, world_size)
     if args.device == "npu":
         os.environ.setdefault("HCCL_NPU_SOCKET_PORT_RANGE", "auto")
         os.environ.setdefault("HCCL_HOST_SOCKET_PORT_RANGE", "auto")
@@ -355,16 +457,16 @@ def main():
             model = AutoModelForCausalLM.from_pretrained(
                 str(args.model), **loading_args
             ).eval()
-        prepare_generation_config(model, profile.report)
         tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
-        with profile.stage("dataset"):
-            loader, tokens = calibration_data(args, tokenizer)
-        profile.report.update(samples_local=len(loader), tokens_local=tokens)
         recipe = Recipe.create_instance(
             str(Path(__file__).with_name("mixed_mxfp.yaml"))
         ).modifiers
         recipe[0].precision = torch.float32
         recipe[1].max_tokens = None
+        with profile.stage("dataset_preflight"):
+            loader = calibration_preflight(
+                args, tokenizer, model, recipe[1], profile.report
+            )
         with profile.stage("oneshot_total"), profile.instrument():
             oneshot(
                 model=model,

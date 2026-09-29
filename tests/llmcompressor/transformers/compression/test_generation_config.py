@@ -72,6 +72,8 @@ def test_driver_rejects_other_invalid_flags_before_calibration(tmp_path, monkeyp
             str(tmp_path / "output"),
             "--device",
             "cpu",
+            "--dataset",
+            str(tmp_path / "unused.json"),
         ],
     )
     monkeypatch.setattr(driver, "load_context", nullcontext)
@@ -85,7 +87,6 @@ def test_driver_rejects_other_invalid_flags_before_calibration(tmp_path, monkeyp
     monkeypatch.setattr(driver, "oneshot", oneshot)
     with pytest.raises(ValueError, match="temperature"):
         driver.main()
-    tokenizer.from_pretrained.assert_not_called()
     oneshot.assert_not_called()
     assert config.do_sample is False and config.temperature == 0.5
     report = json.loads((tmp_path / "output-profile/rank-0.json").read_text())

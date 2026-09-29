@@ -6,8 +6,10 @@
 import json
 import os
 import time
+from collections import Counter
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -18,7 +20,7 @@ from compressed_tensors.offload.cache import DistributedCPUCache
 from compressed_tensors.offload.module import remove_module_offload
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
-from torch.utils.data import DataLoader
+from tokenizers.pre_tokenizers import Whitespace
 from transformers import (
     CompressedTensorsConfig,
     GlmMoeDsaConfig,
@@ -26,11 +28,19 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
-from examples.glm52_precision.oneshot_profile import Profile, quantized_tiles
+from examples.glm52_precision.oneshot_profile import (
+    Profile,
+    calibration_preflight,
+    quantized_tiles,
+)
 from llmcompressor import oneshot
 from llmcompressor.modeling.moe.linearize import linearize_moe
-from llmcompressor.modifiers.transform import QuaRotModifier
+from llmcompressor.modifiers.transform import FlexSmoothModifier, QuaRotModifier
+from llmcompressor.modifiers.transform.flex_smooth import base as flex_base
+from llmcompressor.modifiers.utils.hooks import HooksMixin
+from llmcompressor.pipelines.sequential.helpers import Subgraph
 from llmcompressor.recipe import Recipe
+from tests.flex_smooth.compression_trace import CompressionTrace, state_signature
 from tests.flex_smooth.oneshot_trace import OneshotTrace
 from tests.flex_smooth.test_transformers import _LinearizedGlm
 
@@ -46,10 +56,15 @@ def _fixture(directory):
         for module in model.modules():
             if type(module).__name__.endswith("RMSNorm"):
                 module.weight.copy_(torch.linspace(0.6, 1.4, module.weight.numel()))
+    backend = Tokenizer(
+        WordLevel(
+            {"[UNK]": 0, "[PAD]": 1, **{f"w{i}": i + 2 for i in range(90)}},
+            unk_token="[UNK]",
+        )
+    )
+    backend.pre_tokenizer = Whitespace()
     tokenizer = PreTrainedTokenizerFast(
-        tokenizer_object=Tokenizer(
-            WordLevel({"[UNK]": 0, "[PAD]": 1}, unk_token="[UNK]")
-        ),
+        tokenizer_object=backend,
         unk_token="[UNK]",
         pad_token="[PAD]",
     )
@@ -62,7 +77,7 @@ def _snapshot(model):
     }
 
 
-def _run(model, tokenizer, tokens):
+def _run(model, tokenizer, loader):
     recipe = Recipe.create_instance(
         str(
             Path(__file__).resolve().parents[2]
@@ -71,10 +86,6 @@ def _run(model, tokenizer, tokens):
     ).modifiers
     recipe[0].precision = torch.float32
     recipe[1].max_tokens = None
-    loader = DataLoader(
-        [{"input_ids": row, "attention_mask": torch.ones_like(row)} for row in tokens],
-        batch_size=1,
-    )
     oneshot(
         model=model,
         processor=tokenizer,
@@ -87,6 +98,18 @@ def _run(model, tokenizer, tokens):
         moe_calibrate_all_experts=False,
     )
     return recipe[1].diagnostics
+
+
+def _data(directory, model, tokenizer, report, samples=4):
+    args = SimpleNamespace(
+        dataset=str(directory / "prompts.json"),
+        samples=samples,
+        sequence_length=16,
+        batch_size=2,
+    )
+    return calibration_preflight(
+        args, tokenizer, model, FlexSmoothModifier(max_tokens=None), report
+    )
 
 
 @torch.no_grad()
@@ -114,6 +137,7 @@ def _worker(rank, store, directory, kind):
         )
     rotation_calls = []
     with pytest.MonkeyPatch.context() as patch:
+        compression = CompressionTrace(patch, model)
         trace = OneshotTrace(patch)
         rotate = QuaRotModifier._rotate
         start = QuaRotModifier.on_calibration_start
@@ -151,8 +175,89 @@ def _worker(rank, store, directory, kind):
         if kind == "cpu":
             patch.setattr(DistributedCPUCache, "onload", separate_weight_resident)
         profile = Profile("cpu")
+        profile.report.update(rank=rank, world_size=2, device_map="auto_offload")
+        uneven = {}
+        _data(directory, model, tokenizer, uneven, samples=3)
+        assert uneven["samples_local"] == rank + 1
+        assert uneven["samples_global"] == 3
+        assert uneven["tokens_global_valid"] == 9
+        with pytest.raises(ValueError, match="requires max_tokens=None"):
+            calibration_preflight(
+                SimpleNamespace(
+                    dataset=str(directory / "prompts.json"),
+                    samples=4,
+                    sequence_length=16,
+                    batch_size=2,
+                ),
+                tokenizer,
+                model,
+                FlexSmoothModifier(max_tokens=128 if rank else None),
+                {},
+            )
+        loader = _data(directory, model, tokenizer, profile.report)
+        # The finite distributed cap must fail before the QuaRot callback runs.
+        with pytest.raises(ValueError, match="requires max_tokens=None"):
+            FlexSmoothModifier(max_tokens=128)._preflight(model)
+        assert not rotation_calls
+        rows = [row["input_ids"] for row in loader.dataset]
+        partitions = [None, None]
+        dist.all_gather_object(partitions, rows)
+        assert not set(map(tuple, partitions[0])) & set(map(tuple, partitions[1]))
+        assert partitions[0] + partitions[1] == expected["rows"]
+        assert profile.report["samples_local"] == 2
+        assert profile.report["tokens_local_valid"] == 7
+        assert profile.report["tokens_global_valid"] == 14
+
+        forwards = Counter()
+        forward = Subgraph.forward
+
+        def record_forward(subgraph, model, **kwargs):
+            phase = "propagation" if HooksMixin._HOOKS_DISABLED else "calibration"
+            result = forward(subgraph, model, **kwargs)
+            forwards[(id(subgraph), phase)] += 1
+            return result
+
+        patch.setattr(Subgraph, "forward", record_forward)
+        # Observe the real activation-derived collective; never replace its result.
+        maxima = []
+        search = flex_base.search_alpha_beta_distributed
+
+        def record_search(activations, weights, **kwargs):
+            local = activations.abs().amax(0).cpu()
+            peer_maxima = [None, None]
+            dist.all_gather_object(peer_maxima, local)
+            reductions = Counter()
+            reduce = dist.all_reduce
+
+            def record_reduce(tensor, op=dist.ReduceOp.SUM, **options):
+                reductions[str(op)] += 1
+                return reduce(tensor, op=op, **options)
+
+            with pytest.MonkeyPatch.context() as reduction_patch:
+                reduction_patch.setattr(dist, "all_reduce", record_reduce)
+                result = search(activations, weights, **kwargs)
+            assert reductions[str(dist.ReduceOp.MAX)] == 1
+            assert reductions[str(dist.ReduceOp.SUM)] > 0
+            torch.testing.assert_close(
+                result.activation_max.cpu(),
+                torch.stack(peer_maxima).amax(0),
+                atol=0,
+                rtol=0,
+            )
+            maxima.append(
+                {
+                    "local": local.tolist(),
+                    "global": result.activation_max.tolist(),
+                    "reductions": dict(reductions),
+                }
+            )
+            return result
+
+        patch.setattr(flex_base, "search_alpha_beta_distributed", record_search)
         with profile.instrument():
-            diagnostics = _run(model, tokenizer, tokens[rank : rank + 1])
+            diagnostics = _run(model, tokenizer, loader)
+        assert len(forwards) == 14  # Every local batch runs all seven subgraphs twice.
+        assert set(forwards.values()) == {len(loader)}
         assert profile.stages["flex_search"]["calls"] == 6
         assert profile.stages["flex_apply"]["calls"] == 6
         assert profile.stages["calibration_forward"]["calls"] == 7
@@ -177,7 +282,15 @@ def _worker(rank, store, directory, kind):
             torch.testing.assert_close(
                 value["scale"], baseline["scale"], atol=2e-6, rtol=2e-5
             )
-            assert value["tokens_used"] == tokens.numel()
+            # Flex's reference capture includes padded rows; profile counts valid only.
+            assert value["tokens_used"] == 20
+        shared = [None, None]
+        dist.all_gather_object(shared, (diagnostics, state_signature(model)))
+        assert shared[0][1] == shared[1][1]
+        for name in diagnostics:
+            left, right = shared[0][0][name], shared[1][0][name]
+            assert (left["alpha"], left["beta"]) == (right["alpha"], right["beta"])
+            torch.testing.assert_close(left["scale"], right["scale"], atol=0, rtol=0)
         with disable_offloading():
             logits = model(tokens).logits
         tiles = quantized_tiles(model)
@@ -185,10 +298,54 @@ def _worker(rank, store, directory, kind):
         rotary = model.model.rotary_emb.inv_freq.detach().clone()
         dist.barrier()
         model.save_pretrained(directory / "compressed", save_compressed=True)
+        signatures = [None, None]
+        dist.all_gather_object(signatures, state_signature(model))
+        assert signatures[0] == signatures[1]
+        assert compression.parallel_calls == 1
+        assert compression.real and compression.meta
+        calls = [None, None]
+        dist.all_gather_object(calls, compression.real)
+        assert set(calls[0]).isdisjoint(calls[1])
+        assert sorted(calls[0] + calls[1]) == expected["compressed_modules"]
+        assert compression.writes == int(rank == 0)
         torch.testing.assert_close(
             model.model.rotary_emb.inv_freq, rotary, atol=0, rtol=0
         )
     dist.destroy_process_group()
+    if rank == 0:
+        _reload(directory, tiles, tokens, logits)
+    report = {
+        "rank": rank,
+        "backing": kind,
+        "real_weights": False,
+        "rotation_calls": len(rotation_calls),
+        "events": trace.events,
+        "sample_rows": rows,
+        "uneven_partition": uneven,
+        "subgraphs_per_rank": len(forwards) // 2,
+        "batches_per_subgraph_per_phase": len(loader),
+        "activation_max": maxima,
+        "global_flex_parameters_match_single_rank": True,
+        "cross_rank_flex_parameters_and_weights_exact": True,
+        "flex_parameters": {
+            name: {
+                key: value[key].tolist() if key == "scale" else value[key]
+                for key in ("alpha", "beta", "scale", "tokens_used")
+            }
+            for name, value in diagnostics.items()
+        },
+        "post_flex_observer": True,
+        "shared_weights_match_single_rank": True,
+        "compression": compression.report(),
+        "compressed_state_equal_across_ranks": True,
+        "compressed_reload_exact": rank == 0,
+        "profile": profile.report,
+    }
+    (directory / f"rank-{rank}.json").write_text(json.dumps(report, indent=2))
+
+
+def _reload(directory, tiles, tokens, logits):
+    assert not dist.is_initialized()
     restored, loading = _LinearizedGlm.from_pretrained(
         directory / "compressed",
         local_files_only=True,
@@ -206,26 +363,9 @@ def _worker(rank, store, directory, kind):
                 actual_tiles[name][key], tiles[name][key], atol=0, rtol=0
             )
     torch.testing.assert_close(restored(tokens).logits, logits, atol=0, rtol=0)
-    report = {
-        "rank": rank,
-        "backing": kind,
-        "real_weights": False,
-        "rotation_calls": len(rotation_calls),
-        "events": trace.events,
-        "global_flex_parameters_match_single_rank": True,
-        "post_flex_observer": True,
-        "shared_weights_match_single_rank": True,
-        "compressed_reload_exact": True,
-        "profile": profile.report,
-    }
-    (directory / f"rank-{rank}.json").write_text(json.dumps(report, indent=2))
 
 
-@pytest.mark.parametrize("kind", ["cpu", "disk"])
-@torch.no_grad()
-def test_distributed_sequential_roundtrip(tmp_path, monkeypatch, kind):
-    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
-    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
+def _config(tmp_path):
     GlmMoeDsaConfig(
         vocab_size=96,
         hidden_size=64,
@@ -253,7 +393,19 @@ def test_distributed_sequential_roundtrip(tmp_path, monkeypatch, kind):
         use_cache=False,
         attn_implementation="eager",
     ).save_pretrained(tmp_path / "input")
+
+
+@pytest.mark.parametrize("kind", ["cpu", "disk"])
+@torch.no_grad()
+def test_distributed_sequential_roundtrip(tmp_path, monkeypatch, kind):
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
+    _config(tmp_path)
     model, tokenizer = _fixture(tmp_path)
+    (tmp_path / "prompts.json").write_text(
+        json.dumps(["w1 w2", "w3 w4 w5 w6 w7", "w8 w9", "w10 w11 w12 w13 w14"])
+    )
+    loader = _data(tmp_path, model, tokenizer, {})
     tokens = torch.tensor([[1, 7, 4, 5, 9], [9, 3, 5, 1, 7]])
     rotated = {}
     start = QuaRotModifier.on_calibration_start
@@ -262,21 +414,26 @@ def test_distributed_sequential_roundtrip(tmp_path, monkeypatch, kind):
         start(modifier, state, event, **kwargs)
         rotated.update(_snapshot(state.model))
 
+    compression = CompressionTrace(monkeypatch, model)
     with monkeypatch.context() as patch:
         patch.setattr(QuaRotModifier, "on_calibration_start", record_rotated)
-        diagnostics = _run(model, tokenizer, tokens)
+        diagnostics = _run(model, tokenizer, loader)
     with disable_offloading():
         logits = model(tokens).logits
-    torch.save(
-        {
-            "rotated": rotated,
-            "final": _snapshot(model),
-            "diagnostics": diagnostics,
-            "tokens": tokens,
-            "logits": logits,
-        },
-        tmp_path / "reference.pt",
-    )
+    reference = {
+        "rotated": rotated,
+        "final": _snapshot(model),
+        "diagnostics": diagnostics,
+        "tokens": tokens,
+        "logits": logits,
+        "rows": [row["input_ids"] for row in loader.dataset],
+    }
+    model.save_pretrained(tmp_path / "single-compressed", save_compressed=True)
+    assert compression.parallel_calls == 0 and not compression.meta
+    assert compression.writes == 1
+    assert len(compression.real) == len(set(compression.real)) > 0
+    reference["compressed_modules"] = sorted(compression.real)
+    torch.save(reference, tmp_path / "reference.pt")
     context = mp.spawn(
         _worker,
         args=((tmp_path / "store").as_uri(), str(tmp_path), kind),
@@ -298,5 +455,8 @@ def test_distributed_sequential_roundtrip(tmp_path, monkeypatch, kind):
     ]
     if output := os.environ.get("FLEXSMOOTH_REPORT_DIR"):
         Path(output, f"distributed-oneshot-{kind}.json").write_text(
-            json.dumps(reports, indent=2)
+            json.dumps(
+                {"sequential_compression": compression.report(), "ranks": reports},
+                indent=2,
+            )
         )
