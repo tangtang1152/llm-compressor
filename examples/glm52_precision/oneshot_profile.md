@@ -34,12 +34,20 @@ name remains supported; `--split` defaults to `train_sft` for that route.
 
 `--batch-size` defaults to 1. `DataCollatorWithPadding` uses the tokenizer's own
 pad token and padding side; the driver does not invent or override either. Every
-batch is constructed during preflight before QuaRot. A missing pad token fails
+batch is constructed during preflight before model weight loading. A missing pad token fails
 there. Larger batches than a rank's dataset are valid.
 
-Preflight also runs strict generation-config validation and the existing Flex
-preflight, and checks upstream partition sizes collectively. A local error is
-reported to all ranks before transforms. Profiles/logs record `samples_global`,
+Before loading weights/CT dispatch, preflight reads local `generation_config.json`
+(or derives defaults from local `config.json` if absent), unsets inactive nondefault
+`top_p` whenever `do_sample is not True`, and runs strict validation. Tokenizer,
+dataset, batches and upstream partition sizes are checked in this same phase.
+Local errors are reported to all ranks before weight loading. No checkpoint files
+are changed. The loaded model's generation config is sanitized/validated with the
+same helper, followed by the existing Flex layout preflight before transforms.
+Profile adjustments retain original `top_p`/`do_sample` and distinguish
+`pre_load_validation` from `load_validation`; stage timings separate
+`pre_load_preflight`, `model_load` and `model_preflight`.
+Profiles/logs record `samples_global`,
 `samples_local`, `batches_local`, `batch_size`, `tokens_local_valid`,
 `tokens_global_valid`, global `sequence_length_min/mean/max`, `world_size`, `rank`,
 `device_map`, `flex_max_tokens` and `dataset_source`. Token counts use the attention

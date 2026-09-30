@@ -31,10 +31,12 @@ from datasets import Dataset, ReadInstruction, load_dataset
 from loguru import logger
 from torch.utils.data import DataLoader
 from transformers import (
+    AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
     CompressedTensorsConfig,
     DataCollatorWithPadding,
+    GenerationConfig,
 )
 
 from llmcompressor import oneshot
@@ -285,12 +287,25 @@ def calibration_data(args, tokenizer):
     }
 
 
-def calibration_preflight(args, tokenizer, model, flex, report):
-    """Finish local checks on every rank, then agree on the dataset contract."""
+def calibration_preflight(args, report, *, tokenizer=None, generation_config=None):
+    """Validate local metadata and all batches before loading model weights."""
     loader, stats, error = None, None, None
     try:
-        prepare_generation_config(model, report)
-        flex._preflight(model)  # Reuse the Modifier's existing cap/layout checks.
+        if generation_config is None:
+            if (args.model / "generation_config.json").is_file():
+                generation_config = GenerationConfig.from_pretrained(
+                    args.model, local_files_only=True
+                )
+            else:
+                # Match the legacy local config fallback without loading weights.
+                generation_config = GenerationConfig.from_model_config(
+                    AutoConfig.from_pretrained(args.model, local_files_only=True)
+                )
+        prepare_generation_config(
+            generation_config, report, phase="pre_load_validation"
+        )
+        if tokenizer is None:
+            tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
         loader, stats = calibration_data(args, tokenizer)
     except Exception as caught:
         error = repr(caught)
@@ -312,7 +327,6 @@ def calibration_preflight(args, tokenizer, model, flex, report):
         sequence_length_mean=total_tokens / sum(counts),
         batch_size=args.batch_size,
         dataset_source=str(args.dataset),
-        flex_max_tokens=flex.max_tokens,
         preflight="passed",
     )
     for key in ("sequence_length_min", "sequence_length_max"):
@@ -326,7 +340,24 @@ def calibration_preflight(args, tokenizer, model, flex, report):
             if key not in ("stages", "cache_io", "versions", "generation_config")
         },
     )
-    return loader
+    return loader, tokenizer
+
+
+def model_preflight(model, flex, report):
+    """Recheck loaded metadata and the existing Flex layout before transforms."""
+    error = None
+    try:
+        prepare_generation_config(model.generation_config, report)
+        flex._preflight(model)
+    except Exception as caught:
+        error = repr(caught)
+    errors = [error]
+    if dist.is_initialized():
+        errors = [None] * dist.get_world_size()
+        dist.all_gather_object(errors, error)
+    if any(error is not None for error in errors):
+        raise ValueError(f"Model preflight failed: {errors}")
+    report["flex_max_tokens"] = flex.max_tokens
 
 
 @torch.no_grad()
@@ -356,12 +387,11 @@ def quantized_tiles(model, *, dequantized=False):
     return tiles
 
 
-def prepare_generation_config(model, report):
+def prepare_generation_config(config, report, *, phase="load_validation"):
     """Unset inactive GLM sampling metadata, recording the original value."""
-    config = model.generation_config
-    details = {"adjustments": [], "load_validation": "pending"}
-    report["generation_config"] = details
-    if config.do_sample is False and config.top_p not in (None, 1.0):
+    details = report.setdefault("generation_config", {"adjustments": []})
+    details[phase] = "pending"
+    if config.do_sample is not True and config.top_p not in (None, 1.0):
         details["adjustments"].append(
             {
                 "field": "top_p",
@@ -369,15 +399,16 @@ def prepare_generation_config(model, report):
                 "value": None,
                 "action": "unset_non_sampling_top_p",
                 "do_sample": config.do_sample,
+                "phase": phase,
             }
         )
         config.top_p = None
     try:
         config.validate(strict=True)
     except ValueError:
-        details["load_validation"] = "failed"
+        details[phase] = "failed"
         raise
-    details["load_validation"] = "passed"
+    details[phase] = "passed"
 
 
 def main():
@@ -453,20 +484,19 @@ def main():
         check=True,
     ).stdout.strip()
     try:
-        with profile.stage("model_load"), load_context():
-            model = AutoModelForCausalLM.from_pretrained(
-                str(args.model), **loading_args
-            ).eval()
-        tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
         recipe = Recipe.create_instance(
             str(Path(__file__).with_name("mixed_mxfp.yaml"))
         ).modifiers
         recipe[0].precision = torch.float32
         recipe[1].max_tokens = None
-        with profile.stage("dataset_preflight"):
-            loader = calibration_preflight(
-                args, tokenizer, model, recipe[1], profile.report
-            )
+        with profile.stage("pre_load_preflight"):
+            loader, tokenizer = calibration_preflight(args, profile.report)
+        with profile.stage("model_load"), load_context():
+            model = AutoModelForCausalLM.from_pretrained(
+                str(args.model), **loading_args
+            ).eval()
+        with profile.stage("model_preflight"):
+            model_preflight(model, recipe[1], profile.report)
         with profile.stage("oneshot_total"), profile.instrument():
             oneshot(
                 model=model,

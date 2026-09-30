@@ -58,8 +58,12 @@ def test_variable_length_batches_reach_sequential(
     path = tmp_path / "list.json"
     path.write_text(json.dumps(texts))
     report = {}
-    loader = driver.calibration_preflight(
-        _args(path, batch_size), tokenizer, model, FlexSmoothModifier(), report
+    driver.model_preflight(model, FlexSmoothModifier(), report)
+    loader, _ = driver.calibration_preflight(
+        _args(path, batch_size),
+        report,
+        tokenizer=tokenizer,
+        generation_config=model.generation_config,
     )
     expected = [
         tokenizer(text, add_special_tokens=False)["input_ids"] for text in texts
@@ -129,7 +133,15 @@ def test_local_flex_cap_preflight(tmp_path, cap):
 
 @pytest.mark.parametrize(
     "failure",
-    ["malformed", "empty", "missing_text", "empty_tokens", "padding", "partition"],
+    [
+        "malformed",
+        "empty",
+        "missing_text",
+        "empty_tokens",
+        "padding",
+        "partition",
+        "tokenizer",
+    ],
 )
 def test_driver_data_errors_fail_before_quarot(tmp_path, monkeypatch, failure):
     _config(tmp_path)
@@ -169,17 +181,21 @@ def test_driver_data_errors_fail_before_quarot(tmp_path, monkeypatch, failure):
         ],
     )
     monkeypatch.setattr(driver, "load_context", nullcontext)
-    monkeypatch.setattr(
-        driver.AutoModelForCausalLM, "from_pretrained", lambda *a, **k: model
-    )
-    monkeypatch.setattr(
-        driver.AutoTokenizer, "from_pretrained", lambda *a, **k: tokenizer
-    )
+    load_weights = Mock(side_effect=AssertionError("Weights must not load"))
+    monkeypatch.setattr(driver.AutoModelForCausalLM, "from_pretrained", load_weights)
+
+    def load_tokenizer(*args, **kwargs):
+        if failure == "tokenizer":
+            raise ValueError("Invalid local tokenizer")
+        return tokenizer
+
+    monkeypatch.setattr(driver.AutoTokenizer, "from_pretrained", load_tokenizer)
     rotate = Mock(side_effect=AssertionError("QuaRot must not start"))
     monkeypatch.setattr(QuaRotModifier, "on_calibration_start", rotate)
     with pytest.raises(ValueError, match="preflight|partition"):
         driver.main()
     rotate.assert_not_called()
+    load_weights.assert_not_called()
     report = json.loads((tmp_path / "out-profile/rank-0.json").read_text())
     assert report["status"] == "failed"
 

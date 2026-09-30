@@ -31,6 +31,7 @@ from transformers import (
 from examples.glm52_precision.oneshot_profile import (
     Profile,
     calibration_preflight,
+    model_preflight,
     quantized_tiles,
 )
 from llmcompressor import oneshot
@@ -120,9 +121,11 @@ def _data(directory, model, tokenizer, report, samples=4):
         sequence_length=16,
         batch_size=2,
     )
-    return calibration_preflight(
-        args, tokenizer, model, FlexSmoothModifier(max_tokens=None), report
+    model_preflight(model, FlexSmoothModifier(max_tokens=None), report)
+    loader, _ = calibration_preflight(
+        args, report, tokenizer=tokenizer, generation_config=model.generation_config
     )
+    return loader
 
 
 @torch.no_grad()
@@ -196,14 +199,7 @@ def _worker(rank, store, directory, kind):
         assert uneven["samples_global"] == 3
         assert uneven["tokens_global_valid"] == 9
         with pytest.raises(ValueError, match="requires max_tokens=None"):
-            calibration_preflight(
-                SimpleNamespace(
-                    dataset=str(directory / "prompts.json"),
-                    samples=4,
-                    sequence_length=16,
-                    batch_size=2,
-                ),
-                tokenizer,
+            model_preflight(
                 model,
                 FlexSmoothModifier(max_tokens=128 if rank else None),
                 {},
