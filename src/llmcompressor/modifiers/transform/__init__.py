@@ -3,4 +3,12 @@
 from .quip import QuIPModifier
 from .smoothquant import SmoothQuantModifier
 from .spinquant import SpinQuantModifier
-from .awq import *
+from .flatquant import FlatQuantModifier
+from .awq import (
+    AWQ_DYNAMIC_MAPPING_REGISTRY,
+    AWQ_MAPPING_REGISTRY,
+    AWQMapping,
+    AWQModifier,
+    default_mappings,
+    get_layer_mappings_from_model,
+)
