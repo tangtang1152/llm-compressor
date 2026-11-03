@@ -45,14 +45,15 @@ def transform(weight, gain, projection, rotated=False, seed=1234):
 
 
 @torch.no_grad()
-def qdq(value, activation=False):
-    """Historical CT preset + LLMC min/max observer; QDQ preserves input dtype."""
+def qdq(value, activation=False, *, return_params=False):
+    """Historical CT QDQ; optionally return observer qparams for diagnostics."""
     if value.ndim != 2 or value.shape[-1] % 32 or not torch.isfinite(value).all():
         raise ValueError("expected finite matrix with input dimension divisible by 32")
     args = MXFP4["input_activations" if activation else "weights"].model_copy(deep=True)
     obs = MemorylessMinMaxObserver("input" if activation else "weight", args)
     params = obs(value).get_qparams()
-    return fake_quantize(value, args=args, **params)
+    result = fake_quantize(value, args=args, **params)
+    return (result, params) if return_params else result
 
 
 def errors(reference, actual):

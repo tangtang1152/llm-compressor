@@ -89,3 +89,24 @@ reference LLMC de16f385705239c10bc54add79d4881242ddbb8c;
 ModelSlim 1c6391745db71912bb145e7f139db1cff8cad9e1;
 adjacent CT a66733fcb18d52861ad4ab0e395f621577d51f02 (not imported).
 No branch switch, rebase or merge performed.
+
+Additional validation: 7 pytest tests passed; Ruff passed. A complete synthetic
+2-shard E1 run produced 18 matrix rows and CSV/JSON/Markdown outputs under
+results/synthetic-e1. Its E0 gate also passed at hidden=6144, intermediate=2048,
+8 tokens. This remains synthetic and does not verify the real model's dimensions.
+The earlier Windows pytest temp-directory ACL failure was avoided by an isolated
+.test-data fixture directory (ignored by git); no permissions were changed.
+
+To reproduce the saved synthetic fixture from the repository root:
+
+```bash
+python -c "from pathlib import Path; from experiments.quarot_mxfp4.test_experiment import fixture_checkpoint; p=Path('experiments/quarot_mxfp4/.test-data/demo'); p.mkdir(parents=True,exist_ok=True); fixture_checkpoint(p)"
+python -m experiments.quarot_mxfp4.run --checkpoint experiments/quarot_mxfp4/.test-data/demo --layers 0 1 --experts-per-layer 3 --e0-intermediate 2048 --output /path/to/new/synthetic-run
+```
+
+## Norm Fusion attribution extension
+
+See [DIAGNOSTICS.md](DIAGNOSTICS.md) for independent group diagnostics, reuse of
+prior E1 JSON, transition-layer sampling, plots and Linux commands. Checkpoint
+validation now accepts the optional model.layers.n MTP index entry while selecting
+only main layers. Production algorithms and previous result files are unchanged.

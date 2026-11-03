@@ -42,8 +42,15 @@ class Checkpoint:
             for key in self.index
             if (match := re.match(r"model\.layers\.(\d+)\.", key))
         }
-        if actual != set(range(n)):
-            raise ValueError("index layer topology does not match config")
+        expected = set(range(n))
+        allowed = (expected, expected | {n})
+        if actual not in allowed:
+            raise ValueError(
+                "index layer topology does not match config: "
+                f"expected main layers 0..{n-1} "
+                f"with optional MTP layer {n}, "
+                f"got {sorted(actual)}"
+            )
         self.selection = {}
         for layer in layers:
             if not 0 <= layer < n or layer < cfg.get("first_k_dense_replace", 0):

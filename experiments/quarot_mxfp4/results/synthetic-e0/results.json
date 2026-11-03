@@ -1,0 +1,92 @@
+{
+  "provenance": {
+    "git_commit": "824b9c37030c8413c551b0d5bd34cc8cc6917dca",
+    "git_status": "?? experiments/",
+    "versions": {
+      "torch": "2.14.0+cpu",
+      "llmcompressor": "0.1.dev3278+g50b8bf1",
+      "compressed-tensors": "0.19.1a20260919",
+      "safetensors": "0.8.0",
+      "transformers": "5.17.0"
+    },
+    "package_paths": {
+      "llmcompressor": "D:\\dev\\llmc-precision-extensions\\work\\llm-compressor\\src\\llmcompressor\\__init__.py",
+      "compressed_tensors": "D:\\dev\\llmc-precision-extensions\\.venv\\Lib\\site-packages\\compressed_tensors\\__init__.py"
+    },
+    "implementation_sha256": {
+      "D:\\dev\\llmc-precision-extensions\\.venv\\Lib\\site-packages\\compressed_tensors\\quantization\\utils\\mxfp_utils.py": "fe7e16b7387044c8db8a1682af389057acc5daa2dfe64276d84754b7baaadae4",
+      "D:\\dev\\llmc-precision-extensions\\.venv\\Lib\\site-packages\\compressed_tensors\\quantization\\lifecycle\\forward.py": "17e9245c68a15c747dd27de9935dbcd86466f6b3cd522f200b80c3eb0553272c",
+      "D:\\dev\\llmc-precision-extensions\\work\\llm-compressor\\src\\llmcompressor\\modifiers\\transform\\quarot\\rotation.py": "a23fabaa67d2fe2fe173fd536fd54e6054f7ab3bbf2587b7ac73d31ebf66c86f",
+      "D:\\dev\\llmc-precision-extensions\\work\\llm-compressor\\src\\llmcompressor\\modeling\\fuse.py": "0aece6a40f8c4a01363fadedeb7ce4a0394ef9b598f38c75efc1545a3ce89559"
+    }
+  },
+  "configuration": {
+    "checkpoint": null,
+    "output": "experiments\\quarot_mxfp4\\results\\synthetic-e0",
+    "layers": [
+      3,
+      40,
+      77
+    ],
+    "experts": null,
+    "experts_per_layer": 3,
+    "seed": 1234,
+    "max_elements": 64000000,
+    "e0_hidden": 6144,
+    "e0_intermediate": 256,
+    "threads": 4
+  },
+  "rotation": {
+    "block_size": 32,
+    "seed": 1234,
+    "precision": "float32",
+    "shifted": false
+  },
+  "quantization": {
+    "format": "MXFP4 E2M1/E8M0",
+    "group_size": 32,
+    "axis": -1,
+    "weight": "static minmax",
+    "activation": "dynamic minmax"
+  },
+  "evaluation": "BF16 stored transforms and CT QDQ; FP64 metric reduction; E0 FP32 matmul",
+  "rows": [],
+  "e0": {
+    "fp32": {
+      "b_vs_original": {
+        "max_abs": 1.1920928955078125e-06,
+        "mean_abs": 1.540043139310517e-07,
+        "nmse": 9.249027733680683e-14
+      },
+      "c_vs_original": {
+        "max_abs": 2.2649765014648438e-06,
+        "mean_abs": 3.757432880761395e-07,
+        "nmse": 5.315312366918841e-13
+      },
+      "c_vs_b": {
+        "max_abs": 2.1457672119140625e-06,
+        "mean_abs": 3.726738475595681e-07,
+        "nmse": 5.19293142779941e-13
+      }
+    },
+    "bf16_writeback": {
+      "b_vs_original": {
+        "max_abs": 0.008127212524414062,
+        "mean_abs": 0.0012113257632438978,
+        "nmse": 5.503135725680212e-06
+      },
+      "c_vs_original": {
+        "max_abs": 0.011874482035636902,
+        "mean_abs": 0.0019591580738675535,
+        "nmse": 1.4267745666136653e-05
+      },
+      "c_vs_b": {
+        "max_abs": 0.009350806474685669,
+        "mean_abs": 0.0015353459350619149,
+        "nmse": 8.731721736747564e-06
+      }
+    }
+  },
+  "data_kind": "synthetic E0 only",
+  "status": "complete"
+}
