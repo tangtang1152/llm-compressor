@@ -36,7 +36,7 @@ class Checkpoint:
         h, m = cfg["hidden_size"], cfg["moe_intermediate_size"]
         if h % 32 or m % 32:
             raise ValueError("hidden/intermediate must be divisible by 32")
-        n, ne = cfg["num_hidden_layers"], cfg["n_routed_experts"]
+        n = cfg["num_hidden_layers"]
         actual = {
             int(match[1])
             for key in self.index
@@ -51,13 +51,21 @@ class Checkpoint:
                 f"with optional MTP layer {n}, "
                 f"got {sorted(actual)}"
             )
+        self.select(layers, count, seed, experts)
+
+    def select(self, layers, count, seed, experts=None, selections=None):
+        """Validate selections using the already loaded config/index."""
+        cfg = self.config
+        h, m = cfg["hidden_size"], cfg["moe_intermediate_size"]
+        n, ne = cfg["num_hidden_layers"], cfg["n_routed_experts"]
         self.selection = {}
         for layer in layers:
             if not 0 <= layer < n or layer < cfg.get("first_k_dense_replace", 0):
                 raise ValueError(f"not a routed layer: {layer}")
+            selected = (selections or {}).get(layer, experts)
             ids = (
-                experts
-                if experts is not None
+                sorted(selected)
+                if selected is not None
                 else sorted(random.Random(seed + layer).sample(range(ne), count))
             )
             if (

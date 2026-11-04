@@ -2,29 +2,39 @@
 
 import argparse
 import csv
-import gzip
 import hashlib
 import json
+import random
+import shutil
+import time
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from .core import metrics, percentile, qdq, transform
+from llmcompressor.modifiers.transform.quarot.rotation import rotate_axis
+
+from .core import metrics, percentile, qdq, rotation, transform
 from .run import Checkpoint, provenance
 
 
 def summary(x):
-    x = x.double().flatten()
+    values = x.detach().cpu().numpy().astype(np.float64, copy=False).ravel()
+    if not values.size or not np.isfinite(values).all():
+        raise ValueError("empty or nonfinite statistics")
+    ranks = [max(0, int(np.ceil(values.size * p / 100)) - 1) for p in (50, 90, 95, 99)]
+    selected = np.partition(values, ranks)
     return dict(
-        mean=x.mean().item(),
-        **{f"p{p}": percentile(x, p / 100) for p in (50, 90, 95, 99)},
+        mean=float(values.mean()),
+        **{f"p{p}": float(selected[k]) for p, k in zip((50, 90, 95, 99), ranks)},
     )
 
 
 def corr(x, y):
     x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
     valid = np.isfinite(x) & np.isfinite(y)
+    if not valid.all():
+        raise ValueError("nonfinite correlation input")
     x, y = x[valid], y[valid]
     return dict(
         n=len(x),
@@ -35,6 +45,27 @@ def corr(x, y):
 
 
 def groups(w, quantized=None, scale=None):
+    """FP64 temporaries bounded to 65536 groups; retain only group vectors."""
+    flat = w.reshape(-1, 32)
+    q = None if quantized is None else quantized.reshape_as(flat)
+    parts = {}
+    for start in range(0, len(flat), 65536):
+        stop = start + 65536
+        values = _group_chunk(
+            flat[start:stop],
+            None if q is None else q[start:stop],
+            None if scale is None else scale.flatten()[start:stop],
+        )
+        for key, value in values.items():
+            if key not in parts:
+                parts[key] = torch.empty(len(flat), dtype=torch.float64)
+            parts[key][start:stop] = value
+    if not parts:
+        raise ValueError("empty matrix")
+    return parts
+
+
+def _group_chunk(w, quantized=None, scale=None):
     x = w.double().reshape(-1, 32)
     energy = x.square().sum(-1)
     rms = (energy / 32).sqrt()
@@ -68,9 +99,8 @@ def groups(w, quantized=None, scale=None):
 
 
 def distribution(w, g):
-    x = w.double()
-    rms = x.square().mean().sqrt()
-    result = dict(matrix_absmax_rms=(x.abs().max() / (rms + 1e-30)).item())
+    rms = (g["energy"].sum() / w.numel()).sqrt()
+    result = dict(matrix_absmax_rms=(g["absmax"].max() / (rms + 1e-30)).item())
     for key, value in g.items():
         result.update({f"{key}_{k}": v for k, v in summary(value).items()})
     if "sse" in g:
@@ -99,8 +129,14 @@ def reuse(paths, cp, prov):
         if (
             data["status"] != "complete"
             or data["model_config"] != cp.config
-            or data["quantization"].get("group_size") != 32
-            or data["quantization"].get("axis") != -1
+            or data["quantization"]
+            != dict(
+                format="MXFP4 E2M1/E8M0",
+                group_size=32,
+                axis=-1,
+                weight="static minmax",
+                activation="dynamic minmax",
+            )
             or data["index_sha256"]
             != hashlib.sha256(cp.index_path.read_bytes()).hexdigest()
             or data["rotation"]
@@ -119,7 +155,25 @@ def reuse(paths, cp, prov):
             previous
         ) != fingerprints(prov):
             raise ValueError(f"quantizer/environment fingerprint differs: {path}")
+        declared = {int(k): set(v) for k, v in data["selection"].items()}
+        expected = {
+            (layer_id, e, p)
+            for layer_id, ids in declared.items()
+            for e in ids
+            for p in ("gate_proj", "up_proj", "down_proj")
+        }
+        if {
+            (r["layer"], r["expert"], r["projection"]) for r in data["rows"]
+        } != expected:
+            raise ValueError(f"missing or unexpected prior E1 rows: {path}")
         for row in data["rows"]:
+            for field in ("B_weight_nmse", "C_weight_nmse"):
+                if not np.isfinite(row[field]) or row[field] < 0:
+                    raise ValueError(f"invalid prior NMSE: {path}")
+            if row["tensor_key"] != cp.key(
+                row["layer"], row["expert"], row["projection"]
+            ):
+                raise ValueError(f"prior tensor key mismatch: {path}")
             key = (row["layer"], row["expert"], row["projection"])
             if key in rows and rows[key] != row:
                 raise ValueError(f"conflicting E1 row: {key}")
@@ -145,7 +199,14 @@ def plots(out, matrices, gamma, comparisons, label):
         axes[0, 0].plot(
             layers,
             [
-                np.mean([r["gain_percent"] for r in rows if r["layer"] == layer_id])
+                np.mean(
+                    [
+                        r["gain_percent"]
+                        for r in rows
+                        if r["layer"] == layer_id and r["gain_percent"] is not None
+                    ]
+                    or [np.nan]
+                )
                 for layer_id in layers
             ],
             label=projection,
@@ -216,6 +277,33 @@ def plots(out, matrices, gamma, comparisons, label):
     plt.close(fig)
 
 
+def detail_count(value):
+    if value == "all":
+        return value
+    try:
+        count = int(value)
+        if count >= 0:
+            return count
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError("detail count must be nonnegative or 'all'")
+
+
+def detail_selection(ids, layer, count):
+    ids = sorted(ids)
+    return (
+        ids
+        if count == "all"
+        else sorted(random.Random(1234 + layer).sample(ids, min(count, len(ids))))
+    )
+
+
+def atomic_json(path, value):
+    temp = path.with_suffix(".partial")
+    temp.write_text(json.dumps(value, indent=2, allow_nan=False), encoding="utf-8")
+    temp.replace(path)
+
+
 def main():
     p = argparse.ArgumentParser(__doc__)
     p.add_argument("--checkpoint", type=Path, required=True)
@@ -229,34 +317,78 @@ def main():
     p.add_argument("--experts-per-layer", type=int, default=16)
     p.add_argument("--reuse-e1", type=Path, nargs="*", default=[])
     p.add_argument("--threads", type=int, default=4)
+    p.add_argument("--group-detail-experts-per-layer", type=detail_count, default=0)
+    p.add_argument("--preflight-only", action="store_true")
     a = p.parse_args()
+    if a.threads < 1 or a.experts_per_layer < 1 or len(set(a.layers)) != len(a.layers):
+        p.error("threads/count must be positive and layers must be unique")
     torch.set_num_threads(a.threads)
     a.output.mkdir(parents=True, exist_ok=False)
     prov = provenance()
-    # Metadata-only construction: select prior IDs first, validate
-    # actual selections below.
-    meta = Checkpoint(a.checkpoint, [], 0, 1234)
-    old, selections, sources = reuse(a.reuse_e1, meta, prov)
     result = dict(
         status="running",
         provenance=prov,
-        sources=sources,
         selection={},
-        checkpoint=str(a.checkpoint),
-        model_config=meta.config,
-        data_kind="SYNTHETIC"
-        if meta.config.get("_experiment_synthetic")
-        else "checkpoint diagnostics",
+        detail_selection={},
+        detail_files=[],
         gamma=[],
         matrices=[],
         comparisons=[],
         group_correlations=[],
         e1_rows=[],
+        data_kind="not yet validated",
+        configuration={k: str(v) for k, v in vars(a).items()},
     )
+    result["experiment_source_sha256"] = {
+        name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+        for name in ("diagnose.py", "core.py", "run.py")
+    }
+    started = time.perf_counter()
+    atomic_json(a.output / "diagnostics.json", result)
     try:
+        cp = Checkpoint(a.checkpoint, [], 0, 1234)
+        old, selections, sources = reuse(a.reuse_e1, cp, prov)
+        cp.select(a.layers, a.experts_per_layer, 1234, selections=selections)
+        result.update(
+            sources=sources,
+            index_sha256=hashlib.sha256(cp.index_path.read_bytes()).hexdigest(),
+            rotation=dict(block_size=32, seed=1234, precision="float32", shifted=False),
+            quantization=dict(
+                format="MXFP4 E2M1/E8M0",
+                group_size=32,
+                axis=-1,
+                weight="static minmax",
+                activation="dynamic minmax",
+            ),
+            selection=cp.selection,
+            model_config=cp.config,
+            data_kind="SYNTHETIC"
+            if cp.config.get("_experiment_synthetic")
+            else "checkpoint diagnostics",
+        )
+        result["detail_selection"] = {
+            layer: detail_selection(ids, layer, a.group_detail_experts_per_layer)
+            for layer, ids in cp.selection.items()
+        }
+        ng = cp.config["hidden_size"] * cp.config["moe_intermediate_size"] // 32
+        selected = sum(map(len, cp.selection.values()))
+        detail = sum(map(len, result["detail_selection"].values()))
+        payload = 2 * detail * ng * 26 * 8
+        result["budget"] = dict(
+            groups_all_gate_up=2 * selected * ng,
+            groups_detail_gate_up=2 * detail * ng,
+            detail_payload_bytes=payload,
+            conservative_working_bytes=100 * ng * 32,
+            free_output_bytes=shutil.disk_usage(a.output).free,
+        )
+        print(json.dumps(result["budget"]), flush=True)
+        if shutil.disk_usage(a.output).free < payload * 1.1 + 16 * 1024**2:
+            raise ValueError("insufficient output disk budget")
+        atomic_json(a.output / "preflight.json", result)
+        if a.preflight_only:
+            result["status"] = "preflight_passed"
+            return
         for layer in a.layers:
-            ids = sorted(selections[layer]) if layer in selections else None
-            cp = Checkpoint(a.checkpoint, [layer], a.experts_per_layer, 1234, ids)
             ids = cp.selection[layer]
             result["selection"][layer] = ids
             gain = cp.load(f"model.layers.{layer}.post_attention_layernorm.weight")
@@ -288,14 +420,26 @@ def main():
                         **base, tensor_key=cp.key(*key), shard=cp.index[cp.key(*key)]
                     )
                     stages = {}
+                    fused = None
                     for stage in ("Raw", "Fused", "Rotated"):
                         if stage == "Raw" and projection == "down_proj":
                             continue
                         w = (
                             weight
                             if stage == "Raw"
-                            else transform(weight, gain, projection, stage == "Rotated")
+                            else transform(weight, gain, projection)
+                            if stage == "Fused"
+                            else rotate_axis(
+                                fused,
+                                rotation(gain.numel()),
+                                axis=0 if projection == "down_proj" else 1,
+                                precision=torch.float32,
+                            )
                         )
+                        if stage == "Fused":
+                            fused = w
+                        elif stage == "Rotated":
+                            fused = None
                         q, params = (
                             (None, None)
                             if stage == "Raw"
@@ -321,6 +465,7 @@ def main():
                         formal = calculated
                     result["e1_rows"].append(formal)
                     if projection == "down_proj":
+                        del weight
                         continue
                     raw, b, c = (stages[s] for s in ("Raw", "Fused", "Rotated"))
                     result["group_correlations"].append(
@@ -374,28 +519,31 @@ def main():
                                 ),
                             )
                         )
-                    # Stream all paired groups; bounded to one matrix, gzip limits disk
-                    # use.
-                    columns = {
-                        f"{s}_{k}": v.tolist()
-                        for s, gs in stages.items()
-                        for k, v in gs.items()
-                    }
-                    path = a.output / f"groups-L{layer}-E{expert}-{projection}.csv.gz"
-                    with gzip.open(path, "wt", newline="") as f:
-                        writer = csv.writer(f)
-                        writer.writerow(
-                            ["row", "input_group", "gamma_abs_cv", *columns]
-                        )
-                        ncol = weight.shape[1] // 32
-                        gamma_cv = gr["abs_cv"].tolist()
-                        for i, values in enumerate(zip(*columns.values())):
-                            writer.writerow(
-                                [i // ncol, i % ncol, gamma_cv[i % ncol], *values]
+                    if expert in result["detail_selection"][layer]:
+                        path = a.output / f"groups-L{layer}-E{expert}-{projection}.npz"
+                        with path.with_suffix(".partial").open("wb") as stream:
+                            np.savez(
+                                stream,
+                                shape=np.asarray(weight.shape),
+                                gamma_abs_cv=gr["abs_cv"].numpy(),
+                                **{
+                                    f"{stage}_{key}": v.numpy()
+                                    for stage, gs in stages.items()
+                                    for key, v in gs.items()
+                                },
                             )
+                        path.with_suffix(".partial").replace(path)
+                        result["detail_files"].append(
+                            dict(
+                                path=path.name,
+                                groups=weight.numel() // 32,
+                                bytes=path.stat().st_size,
+                            )
+                        )
+                    del raw, b, c, gs
                     del weight, stages
                 print(f"layer={layer} expert={expert} complete", flush=True)
-        result["status"] = "complete"
+        result["status"] = "finalizing"
         result["matrix_correlations"] = []
         for projection in ("gate_proj", "up_proj"):
             for layer in [None, *a.layers]:
@@ -423,77 +571,88 @@ def main():
                             ),
                         )
                     )
-        plots(
-            a.output,
-            result["matrices"],
-            result["gamma"],
-            result["comparisons"],
-            result["data_kind"],
-        )
-    except Exception as exc:
+        result["status"] = "complete"
+    except BaseException as exc:
         result.update(status="failed", error=repr(exc))
         raise
     finally:
-        (a.output / "diagnostics.json").write_text(
-            json.dumps(result, indent=2, allow_nan=False), encoding="utf-8"
+        result["elapsed_seconds"] = time.perf_counter() - started
+        # Persist running/failed before final artifact writes; complete only afterwards.
+        status = result["status"]
+        result["status"] = "finalizing" if status == "complete" else status
+        atomic_json(a.output / "diagnostics.json", result)
+        try:
+            finalize(a, result, status)
+        except BaseException as exc:
+            result.update(status="failed", error=repr(exc))
+            atomic_json(a.output / "diagnostics.json", result)
+            raise
+        result["status"] = status
+        atomic_json(a.output / "diagnostics.json", result)
+
+
+def finalize(a, result, status):
+    result["status"] = status
+    if status != "complete":
+        (a.output / "summary.md").write_text(
+            f"# E1.2 {status}\n\n{result.get('error', 'No measurements performed.')}\n"
+            "Partial files must not be interpreted as a completed experiment.\n",
+            encoding="utf-8",
         )
-        for name in (
-            "gamma",
-            "matrices",
-            "comparisons",
-            "group_correlations",
-            "matrix_correlations",
-            "e1_rows",
-        ):
-            write_csv(a.output / f"{name}.csv", result.get(name, []))
-        lines = [
-            "# Norm fusion / MXFP4 diagnostics",
-            "",
-            f"Status: {result['status']}; data: {result['data_kind']}",
-            "",
-            "Raw is distribution-only. Formal B/C rows retain E1 columns.",
-            "All correlations are descriptive; groups share gamma and matrices "
-            "within layers are dependent.",
-            "Pooled correlations can reflect layer differences. Within-layer "
-            "results are also provided.",
-            "No causal attribution or full Expert W4A4 conclusion follows from "
-            "these measurements.",
-            "",
-            "|Layer|Projection|N matrices|Mean gain %|Mean Fusion Group "
-            "Max/RMS change|",
-            "|---|---|---|---|---|",
-        ]
-        for layer in a.layers:
-            for proj in ("gate_proj", "up_proj"):
-                rows = [
-                    r
-                    for r in result["comparisons"]
-                    if r["layer"] == layer
-                    and r["projection"] == proj
-                    and r["gain_percent"] is not None
-                ]
-                if rows:
-                    fusion_mean = np.mean(
-                        [r["fusion_max_rms_delta_mean"] for r in rows]
-                    )
-                    lines.append(
-                        f"|{layer}|{proj}|{len(rows)}|"
-                        f"{np.mean([r['gain_percent'] for r in rows]):.4g}|"
-                        f"{fusion_mean:.4g}|"
-                    )
-        lines += [
-            "",
-            "![Layer trends](layer_trends.png)",
-            "![Group quantiles](group_error_distribution.png)",
-            "",
-            "Hypotheses: gamma heterogeneity may amplify within-group "
-            "imbalance; B32 may reduce it.",
-            "Check paired groups, scale histograms and zero rates before "
-            "accepting this explanation.",
-            "Shared gamma is compatible with synchronous gate/up gains but "
-            "does not prove causation.",
-        ]
-        (a.output / "summary.md").write_text("\n".join(lines), encoding="utf-8")
+        return
+    for name in (
+        "gamma",
+        "matrices",
+        "comparisons",
+        "group_correlations",
+        "matrix_correlations",
+        "e1_rows",
+    ):
+        write_csv(a.output / f"{name}.csv", result.get(name, []))
+    lines = [
+        "# Norm fusion / MXFP4 diagnostics",
+        "",
+        f"Status: {result['status']}; data: {result['data_kind']}",
+        "",
+        "Raw is distribution-only. Formal B/C rows retain E1 columns.",
+        "All correlations are descriptive; groups share gamma and matrices "
+        "within layers are dependent.",
+        "Pooled correlations can reflect layer differences. Within-layer "
+        "results are also provided.",
+        "No causal attribution or full Expert W4A4 conclusion follows from "
+        "these measurements.",
+        "",
+        "|Layer|Projection|N matrices|Mean gain %|Mean Fusion Group " "Max/RMS change|",
+        "|---|---|---|---|---|",
+    ]
+    for layer in a.layers:
+        for proj in ("gate_proj", "up_proj"):
+            rows = [
+                r
+                for r in result["comparisons"]
+                if r["layer"] == layer
+                and r["projection"] == proj
+                and r["gain_percent"] is not None
+            ]
+            if rows:
+                fusion_mean = np.mean([r["fusion_max_rms_delta_mean"] for r in rows])
+                lines.append(
+                    f"|{layer}|{proj}|{len(rows)}|"
+                    f"{np.mean([r['gain_percent'] for r in rows]):.4g}|"
+                    f"{fusion_mean:.4g}|"
+                )
+    lines += [
+        "",
+        "Plots can be generated locally using the report module.",
+        "",
+        "Hypotheses: gamma heterogeneity may amplify within-group "
+        "imbalance; B32 may reduce it.",
+        "Check paired groups, scale histograms and zero rates before "
+        "accepting this explanation.",
+        "Shared gamma is compatible with synchronous gate/up gains but "
+        "does not prove causation.",
+    ]
+    (a.output / "summary.md").write_text("\n".join(lines), encoding="utf-8")
 
 
 if __name__ == "__main__":
