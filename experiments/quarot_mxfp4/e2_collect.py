@@ -203,7 +203,7 @@ def main():
             dist.barrier()
         status["stage"] = "capturing"
         atomic_json(status_path, status)
-        collector = RoutedCapture(selection)
+        collector = RoutedCapture(selection, output=args.output / f"rank{rank}")
         device = (
             torch.device("npu", torch.npu.current_device())
             if args.device == "npu"
@@ -218,11 +218,16 @@ def main():
         error = None
         if rank == 0:
             try:
-                merge_shards(
+                merged = merge_shards(
                     [args.output / f"rank{i}" for i in range(world)],
                     args.output / "capture",
                     source,
                 )
+                if merged["cleanup_status"] != "complete":
+                    raise RuntimeError(
+                        "archive complete but rank cleanup failed: "
+                        f"{merged['cleanup_errors']}"
+                    )
             except Exception as exc:
                 error = repr(exc)
         consensus(error)

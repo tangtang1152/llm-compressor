@@ -2,12 +2,11 @@
 
 import contextlib
 import hashlib
-import json
+import shutil
 from pathlib import Path
 
 import torch
 from compressed_tensors.offload import disable_offloading, set_onload_device
-from safetensors.torch import load_file
 from torch.fx import Graph
 
 from llmcompressor.args.dataset_arguments import DatasetArguments
@@ -16,7 +15,8 @@ from llmcompressor.pipelines.cache import IntermediatesCache
 from llmcompressor.pipelines.sequential.helpers import Subgraph, trace_subgraphs
 from llmcompressor.utils.helpers import calibration_forward_context
 
-from .e2_capture import RoutedCapture
+from .diagnose import atomic_json
+from .e2_capture import file_hash, read_manifest, read_part
 
 TARGETS = [r"re:.*\.input_layernorm$", "ExpertMLP", "GlmMoeDsaMLP"]
 
@@ -208,79 +208,172 @@ def collect(model, batches, sample_ids, collector, device=torch.device("cpu")):
 
 
 def merge_shards(paths, output, source):
-    """Bounded merge: global priority reservoir, no per-rank minimum requirement."""
-    merged = None
-    seen = set()
-    for directory in map(Path, paths):
-        manifest = json.loads((directory / "capture_manifest.json").read_text())
-        if manifest["status"] != "rank_shard_complete" or manifest["source"] != source:
-            raise ValueError("incomplete/incompatible capture rank shard")
-        selection = {int(k): v for k, v in manifest["selection"].items()}
-        if merged is None:
-            merged = RoutedCapture(selection, manifest["target"], manifest["minimum"])
-        if (selection, manifest["target"], manifest["minimum"]) != (
-            merged.selection,
-            merged.target,
-            merged.minimum,
-        ):
-            raise ValueError("incompatible rank capture configuration")
-        samples = set(map(tuple, manifest["seen_samples"]))
-        if seen & samples:
-            raise ValueError("overlapping rank sample partitions")
-        seen |= samples
-        merged.norm_errors.extend(manifest["norm_errors"])
-        for name, value in manifest["expert_weight_sha256"].items():
-            if name in merged.weight_hashes and merged.weight_hashes[name] != value:
-                raise ValueError("rank expert weight mismatch")
-            merged.weight_hashes[name] = value
-        for layer, eps in manifest["norm_epsilon"].items():
-            layer = int(layer)
-            if layer in merged.norm_eps and merged.norm_eps[layer] != eps:
-                raise ValueError("rank norm epsilon mismatch")
-            merged.norm_eps[layer] = eps
-        entries = {(e["layer"], e["expert"]): e for e in manifest["experts"]}
-        if set(entries) != set(merged.buffers) or len(entries) != len(
-            manifest["experts"]
-        ):
-            raise ValueError("rank expert set mismatch")
-        for key, entry in entries.items():
-            merged.counts[key] += entry["available"]
-            if not entry["retained"]:
-                continue
-            path = (directory / entry["file"]).resolve()
+    """Validate/copy one block at a time, then clean only verified temporary shards."""
+    output = Path(output).resolve()
+    directories = [Path(p).absolute() for p in paths]
+    if not directories or len(set(directories)) != len(directories):
+        raise ValueError("missing/overlapping rank shard paths")
+    if any(
+        p.is_symlink() or p.resolve().parent != output.parent or p.resolve() == output
+        for p in directories
+    ):
+        raise ValueError(
+            "rank shards must be distinct sibling directories of final archive"
+        )
+    directories = [p.resolve() for p in directories]
+    if source.get("world_size", len(directories)) != len(directories):
+        raise ValueError("missing rank shards")
+    output.mkdir(parents=True, exist_ok=False)
+    (output / "captured_activations").mkdir()
+    merged = dict(
+        status="incomplete",
+        format_version=2,
+        archive_policy="all_routed_valid_tokens",
+        source=source,
+        seed=1234,
+        experts=[],
+        seen_samples=[],
+        norm_errors=[],
+        norm_epsilon={},
+        expert_weight_sha256={},
+        gamma_bf16={},
+        cleanup_status="pending",
+    )
+    atomic_json(output / "capture_manifest.json", merged)
+    seen, identities, entries, cleanup_files = set(), {}, {}, {}
+    seen_sample_ids = set()
+    try:
+        for rank, directory in enumerate(directories):
+            manifest = read_manifest(directory)
             if (
-                not path.is_relative_to(directory.resolve())
-                or hashlib.sha256(path.read_bytes()).hexdigest() != entry["sha256"]
+                manifest["status"] != "rank_shard_complete"
+                or manifest["source"] != source
             ):
-                raise ValueError("rank tensor hash/path mismatch")
-            tensors = load_file(str(path))
-            layer, expert = key
-            gamma = tensors["gamma"]
-            if layer in merged.gammas and not torch.equal(merged.gammas[layer], gamma):
-                raise ValueError("rank gamma mismatch")
-            merged.gammas[layer] = gamma
-            rows = merged.buffers[key]
-            for i, (sample, pos) in enumerate(
-                zip(tensors["sample_id"].tolist(), tensors["token_position"].tolist())
-            ):
-                priority = hashlib.sha256(
-                    f"1234:{layer}:{expert}:{sample}:{pos}".encode()
-                ).hexdigest()
-                rows.append(
-                    (
-                        priority,
-                        sample,
-                        pos,
-                        tensors["z"][i].clone(),
-                        tensors["z_gamma"][i].clone(),
-                        tensors["router_weight"][i].clone(),
+                raise ValueError("incomplete/incompatible capture rank shard")
+            if rank == 0:
+                merged["selection"] = manifest["selection"]
+                entries = {
+                    (e["layer"], e["expert"]): dict(
+                        layer=e["layer"],
+                        expert=e["expert"],
+                        available=0,
+                        retained=0,
+                        parts=[],
                     )
-                )
-            merged.buffers[key] = sorted(rows, key=lambda r: (r[0], r[1], r[2]))[
-                : merged.target
-            ]
-    if merged is None:
-        raise ValueError("no capture shards")
-    merged.seen = seen
-    merged.save(output, source)
+                    for e in manifest["experts"]
+                }
+                identities = {key: set() for key in entries}
+            elif merged["selection"] != manifest["selection"]:
+                raise ValueError("incompatible rank selection")
+            samples = set(map(tuple, manifest["seen_samples"]))
+            sample_ids = {sample for _, sample in samples}
+            if seen_sample_ids & sample_ids:
+                raise ValueError("overlapping rank sample partitions")
+            if samples != {
+                (int(layer), sample)
+                for layer in manifest["selection"]
+                for sample in sample_ids
+            }:
+                raise ValueError("incomplete rank sample/layer coverage")
+            seen_sample_ids |= sample_ids
+            seen |= samples
+            merged["norm_errors"].extend(manifest["norm_errors"])
+            for field in ("expert_weight_sha256", "norm_epsilon", "gamma_bf16"):
+                for key, value in manifest[field].items():
+                    if key in merged[field] and merged[field][key] != value:
+                        raise ValueError(f"rank {field} mismatch")
+                    merged[field][key] = value
+            allowed = {directory / "capture_manifest.json"}
+            for entry in manifest["experts"]:
+                key = (entry["layer"], entry["expert"])
+                dest = entries[key]
+                dest["available"] += entry["available"]
+                for part in entry["parts"]:
+                    data, positions = read_part(directory, part)
+                    if identities[key].intersection(positions):
+                        raise ValueError("duplicate token identity across shards")
+                    if any((key[0], sample) not in samples for sample, _ in positions):
+                        raise ValueError("token outside rank sample partition")
+                    gamma = torch.tensor(
+                        manifest["gamma_bf16"][str(key[0])], dtype=torch.bfloat16
+                    )
+                    if not torch.equal(data["gamma"], gamma):
+                        raise ValueError("archived gamma mismatch")
+                    identities[key].update(positions)
+                    src = (directory / part["file"]).resolve()
+                    allowed.add(src)
+                    relative = (
+                        f"captured_activations/L{key[0]}-E{key[1]}-"
+                        f"P{len(dest['parts'])}.safetensors"
+                    )
+                    target = output / relative
+                    shutil.copyfile(src, target)
+                    if file_hash(target) != part["sha256"]:
+                        raise ValueError("merged archive copy hash mismatch")
+                    dest["parts"].append(dict(part, file=relative))
+                    dest["retained"] += len(positions)
+                    del data
+            # Exact owned file set, no symlinks/junctions or unrelated files. This
+            # is also checked again immediately before recursive cleanup.
+            cleanup_files[directory] = allowed
+            _check_cleanup_tree(directory, allowed, output)
+        if "global_sample_ids" in source:
+            expected = {
+                (int(layer), sample)
+                for layer in merged["selection"]
+                for sample in source["global_sample_ids"]
+            }
+            if seen != expected:
+                raise ValueError("missing/extra global sample coverage")
+        if any(
+            e["retained"] != e["available"] or len(identities[key]) != e["available"]
+            for key, e in entries.items()
+        ):
+            raise ValueError("lost/truncated/duplicate tokens in merge")
+        merged["experts"] = list(entries.values())
+        merged["seen_samples"] = sorted(seen)
+        merged["tensor_bytes"] = sum(
+            p["tensor_bytes"] for e in entries.values() for p in e["parts"]
+        )
+        merged["archive_file_bytes"] = sum(
+            p["file_bytes"] for e in entries.values() for p in e["parts"]
+        )
+        merged["status"] = "complete"
+        atomic_json(output / "capture_manifest.json", merged)
+    except BaseException as exc:
+        merged.update(status="incomplete", error=repr(exc))
+        atomic_json(output / "capture_manifest.json", merged)
+        raise  # Every original shard remains available; never clean on merge failure.
+    cleanup_errors = []
+    for directory, allowed in cleanup_files.items():
+        try:
+            _check_cleanup_tree(directory, allowed, output)
+            shutil.rmtree(directory)
+        except OSError as exc:
+            cleanup_errors.append(dict(path=str(directory), error=repr(exc)))
+        except ValueError as exc:
+            cleanup_errors.append(dict(path=str(directory), error=repr(exc)))
+    merged["cleanup_status"] = "failed" if cleanup_errors else "complete"
+    merged["cleanup_errors"] = cleanup_errors
+    atomic_json(output / "capture_manifest.json", merged)
     return merged
+
+
+def _check_cleanup_tree(directory, allowed, output):
+    """Deletion is restricted to explicitly supplied, verified sibling shards."""
+    if (
+        directory.resolve().parent != output.parent
+        or directory == output
+        or directory.is_symlink()
+    ):
+        raise ValueError("unsafe rank shard cleanup path")
+    children = list(directory.rglob("*"))
+    if any(
+        p.is_symlink() or getattr(p, "is_junction", lambda: False)()
+        for p in [directory, *children]
+    ):
+        raise ValueError("linked rank shard cleanup path")
+    if {p.resolve() for p in children if p.is_file()} != allowed:
+        raise ValueError("unexpected files in temporary rank shard; preserve it")
+    if any(p.is_dir() and p != directory / "captured_activations" for p in children):
+        raise ValueError("unexpected directories in rank shard; preserve it")

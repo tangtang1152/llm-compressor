@@ -1,10 +1,11 @@
 """Validated capture boundary, not a model loader or unverified pipeline driver."""
 
 import hashlib
+import json
 from pathlib import Path
 
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
 from .diagnose import atomic_json
 
@@ -16,6 +17,100 @@ SELECTION = {
 }
 
 
+def file_hash(path):
+    with Path(path).open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def token_priority(layer, expert, sample, position):
+    return hashlib.sha256(
+        f"1234:{layer}:{expert}:{sample}:{position}".encode()
+    ).hexdigest()
+
+
+def read_part(root, part):
+    """Validate one lossless archive block; memory is bounded by one sample."""
+    root = Path(root).resolve()
+    path = (root / part["file"]).resolve()
+    if (
+        not path.is_relative_to(root)
+        or path.is_symlink()
+        or file_hash(path) != part["sha256"]
+    ):
+        raise ValueError("capture path/hash mismatch")
+    data = load_file(str(path))
+    if set(data) != {
+        "z",
+        "z_gamma",
+        "gamma",
+        "router_weight",
+        "sample_id",
+        "token_position",
+    }:
+        raise ValueError("capture tensor keys mismatch")
+    z = data["z"]
+    n = part["retained"]
+    if (
+        z.ndim != 2
+        or len(z) != n
+        or n <= 0
+        or data["z_gamma"].shape != z.shape
+        or data["gamma"].shape != (z.shape[1],)
+        or any(data[k].dtype != torch.bfloat16 for k in ("z", "z_gamma", "gamma"))
+        or any(
+            data[k].shape != (n,)
+            for k in ("router_weight", "sample_id", "token_position")
+        )
+        or any(data[k].dtype != torch.int64 for k in ("sample_id", "token_position"))
+        or not data["router_weight"].is_floating_point()
+        or not all(torch.isfinite(t).all() for t in data.values())
+        or any(
+            (data[k] < 0).any()
+            for k in ("router_weight", "sample_id", "token_position")
+        )
+    ):
+        raise ValueError("invalid capture tensors/count/dtype")
+    identities = list(zip(data["sample_id"].tolist(), data["token_position"].tolist()))
+    if len(set(identities)) != n:
+        raise ValueError("duplicate token identity")
+    if path.stat().st_size != part["file_bytes"]:
+        raise ValueError("capture byte count mismatch")
+    if sum(t.numel() * t.element_size() for t in data.values()) != part["tensor_bytes"]:
+        raise ValueError("capture tensor byte count mismatch")
+    return data, identities
+
+
+def read_manifest(root):
+    manifest = json.loads((Path(root) / "capture_manifest.json").read_text())
+    if (
+        manifest.get("format_version") != 2
+        or manifest.get("archive_policy") != "all_routed_valid_tokens"
+    ):
+        raise ValueError(
+            "requires full archive format 2; legacy capped captures are not "
+            "full archives"
+        )
+    expected = {
+        (int(layer), e)
+        for layer, experts in manifest["selection"].items()
+        for e in experts
+    }
+    keys = [(e["layer"], e["expert"]) for e in manifest["experts"]]
+    if len(keys) != len(set(keys)) or set(keys) != expected:
+        raise ValueError("capture expert set mismatch")
+    for entry in manifest["experts"]:
+        if entry["available"] != entry["retained"] or entry["retained"] != sum(
+            p["retained"] for p in entry["parts"]
+        ):
+            raise ValueError("truncated capture: retained != available/parts")
+    seen = list(map(tuple, manifest["seen_samples"]))
+    if len(seen) != len(set(seen)):
+        raise ValueError("duplicate captured sample")
+    if set(manifest["gamma_bf16"]) != set(manifest["selection"]):
+        raise ValueError("missing layer gamma")
+    return manifest
+
+
 class RoutedCapture:
     """Caller supplies actual BF16 norm/router outputs and global sample IDs.
 
@@ -23,11 +118,8 @@ class RoutedCapture:
     sequential graph's norm/router/expert alignment has been verified.
     """
 
-    def __init__(self, selection=None, target=512, minimum=128):
-        if not 1 <= minimum <= target:
-            raise ValueError("invalid token thresholds")
+    def __init__(self, selection=None, *, output=None):
         self.selection = SELECTION if selection is None else selection
-        self.target, self.minimum = target, minimum
         self.buffers = {
             (layer_id, e): [] for layer_id, ids in self.selection.items() for e in ids
         }
@@ -37,6 +129,31 @@ class RoutedCapture:
         self.gammas = {}
         self.norm_eps = {}
         self.weight_hashes = {}
+        self.parts = {key: [] for key in self.buffers}
+        self.output = Path(output).resolve() if output is not None else None
+        if self.output is not None:
+            self.output.mkdir(parents=True, exist_ok=False)
+            (self.output / "captured_activations").mkdir()
+
+    def write_part(self, key, tensors):
+        layer, expert = key
+        path = (
+            self.output
+            / "captured_activations"
+            / f"L{layer}-E{expert}-P{len(self.parts[key])}.safetensors"
+        )
+        save_file(tensors, str(path))
+        self.parts[key].append(
+            dict(
+                file=path.relative_to(self.output).as_posix(),
+                sha256=file_hash(path),
+                retained=len(tensors["z"]),
+                file_bytes=path.stat().st_size,
+                tensor_bytes=sum(
+                    t.numel() * t.element_size() for t in tensors.values()
+                ),
+            )
+        )
 
     @torch.no_grad()
     def add(
@@ -92,8 +209,7 @@ class RoutedCapture:
         # FP32 here; CPU replay metrics use FP64. No full norm batch CPU copy.
         delta = reconstructed.float() - norm_output.float()
         discrepancy = dict(
-            max_abs=delta.abs().max().item(),
-            mean_abs=delta.abs().mean().item(),
+            mse=delta.square().mean().item(),
             nmse=(
                 delta.square().sum() / (norm_output.float().square().sum() + 1e-30)
             ).item(),
@@ -112,55 +228,33 @@ class RoutedCapture:
                 raise ValueError("duplicate expert assignment within a token")
             key = (layer, expert)
             self.counts[key] += len(token)
-            # Deterministic hash-priority reservoir: order/rank-shard independent
-            # when fed global sample IDs. Store only the best target candidates.
-            candidates = [
-                (
-                    hashlib.sha256(
-                        f"1234:{layer}:{expert}:{sample_id}:{int(t)}".encode()
-                    ).hexdigest(),
-                    int(t),
-                    int(s),
+            if len(token):
+                tensors = dict(
+                    z=z[token].cpu(),
+                    z_gamma=norm_output[token].cpu(),
+                    router_weight=routing_weights[token, slot].cpu(),
+                    sample_id=torch.full((len(token),), sample_id, dtype=torch.int64),
+                    token_position=token.cpu(),
+                    gamma=gamma,
                 )
-                for t, s in zip(token.cpu().tolist(), slot.cpu().tolist())
-            ]
-            existing = self.buffers[key]
-            threshold = (
-                sorted(r[0] for r in existing)[-1]
-                if len(existing) == self.target
-                else None
-            )
-            chosen = [
-                r
-                for r in sorted(candidates)[: self.target]
-                if threshold is None or r[0] < threshold
-            ]
-            if chosen:
-                ts = torch.tensor([r[1] for r in chosen], device=z.device)
-                ss = torch.tensor([r[2] for r in chosen], device=z.device)
-                zs, ys, rs = (
-                    z[ts].cpu(),
-                    norm_output[ts].cpu(),
-                    routing_weights[ts, ss].cpu(),
-                )
-                for i, (priority, t, _) in enumerate(chosen):
-                    existing.append(
-                        (
-                            priority,
-                            sample_id,
-                            t,
-                            zs[i].clone(),
-                            ys[i].clone(),
-                            rs[i].clone(),
-                        )
-                    )
-            self.buffers[key] = sorted(existing, key=lambda r: (r[0], r[1], r[2]))[
-                : self.target
-            ]
+                if self.output is None:  # tiny in-memory fixtures only
+                    self.buffers[key].append(tensors)
+                else:
+                    self.write_part(key, tensors)
 
     def save(self, output, source, *, rank_shard=False):
-        output = Path(output)
-        output.mkdir(parents=True, exist_ok=False)
+        output = Path(output).resolve()
+        if self.output is None:
+            output.mkdir(parents=True, exist_ok=False)
+            (output / "captured_activations").mkdir()
+            self.output = output
+            for key, chunks in self.buffers.items():
+                for tensors in chunks:
+                    self.write_part(key, tensors)
+        elif output != self.output or (output / "capture_manifest.json").exists():
+            raise FileExistsError(
+                "capture output must be the collector's fresh directory"
+            )
         real = source.get("kind") == "real_bf16"
         required = (
             "dataset",
@@ -183,55 +277,41 @@ class RoutedCapture:
             status="incomplete",
             source=source,
             selection=self.selection,
-            target=self.target,
-            minimum=self.minimum,
+            format_version=2,
+            archive_policy="all_routed_valid_tokens",
             seed=1234,
             experts=[],
             norm_errors=self.norm_errors,
             norm_epsilon=self.norm_eps,
+            gamma_bf16={layer: g.float().tolist() for layer, g in self.gammas.items()},
             expert_weight_sha256=self.weight_hashes,
             seen_samples=sorted(self.seen),
         )
-        for (layer, expert), rows in self.buffers.items():
+        for (layer, expert), parts in self.parts.items():
             manifest["experts"].append(
                 dict(
                     layer=layer,
                     expert=expert,
                     available=self.counts[(layer, expert)],
-                    retained=len(rows),
+                    retained=sum(p["retained"] for p in parts),
+                    parts=parts,
                 )
             )
         atomic_json(output / "capture_manifest.json", manifest)
-        if not rank_shard and any(
-            len(rows) < self.minimum for rows in self.buffers.values()
-        ):
-            raise ValueError(
-                "insufficient routed tokens; increase samples from same dataset, "
-                "never fill randomly"
-            )
-        directory = output / "captured_activations"
-        directory.mkdir()
+        read_manifest(output)
         for entry in manifest["experts"]:
-            layer, expert = entry["layer"], entry["expert"]
-            rows = self.buffers[(layer, expert)]
-            if not rows:
-                continue
-            tensors = dict(
-                z=torch.stack([r[3] for r in rows]),
-                z_gamma=torch.stack([r[4] for r in rows]),
-                router_weight=torch.stack([r[5] for r in rows]),
-                sample_id=torch.tensor([r[1] for r in rows]),
-                token_position=torch.tensor([r[2] for r in rows]),
-                gamma=self.gammas[layer],
-            )
-            path = directory / f"L{layer}-E{expert}.safetensors"
-            save_file(tensors, str(path))
-            entry.update(
-                file=path.relative_to(output).as_posix(),
-                sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
-                sample_positions=[[r[1], r[2]] for r in rows],
-                router_weight_min=float(tensors["router_weight"].min()),
-                router_weight_max=float(tensors["router_weight"].max()),
-            )
+            identities = set()
+            for part in entry["parts"]:
+                _, positions = read_part(output, part)
+                if identities.intersection(positions):
+                    raise ValueError("duplicate token identity")
+                identities.update(positions)
+        manifest["tensor_bytes"] = sum(
+            p["tensor_bytes"] for e in manifest["experts"] for p in e["parts"]
+        )
+        manifest["archive_file_bytes"] = sum(
+            p["file_bytes"] for e in manifest["experts"] for p in e["parts"]
+        )
         manifest["status"] = "rank_shard_complete" if rank_shard else "complete"
         atomic_json(output / "capture_manifest.json", manifest)
+        return manifest

@@ -2,6 +2,7 @@
 
 import argparse
 import hashlib
+import heapq
 import json
 from pathlib import Path
 
@@ -11,8 +12,8 @@ from safetensors.torch import load_file
 from torch.nn import functional as F
 
 from .core import inverse_hidden, qdq, rotation, transform
-from .diagnose import atomic_json, corr, summary, write_csv
-from .e2_capture import SELECTION
+from .diagnose import atomic_json, write_csv
+from .e2_capture import SELECTION, file_hash, read_manifest, read_part, token_priority
 from .run import Checkpoint, provenance
 
 MODES = {
@@ -24,24 +25,48 @@ MODES = {
 PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 
 
-def error_stats(ref, actual):
+def ratio(numerator, denominator):
+    return numerator / denominator if denominator else None
+
+
+def metric_values(sse, energy, elements, token_nmse=None):
+    result = dict(
+        sse=sse,
+        reference_energy=energy,
+        elements=elements,
+        mse=sse / elements,
+        nmse=ratio(sse, energy),
+    )
+    if token_nmse is None:
+        return result
+    finite = token_nmse[np.isfinite(token_nmse)]
+    result.update(
+        token_nmse_p50=float(np.quantile(finite, 0.5)) if len(finite) else None,
+        token_nmse_p95=float(np.quantile(finite, 0.95)) if len(finite) else None,
+        token_nmse_defined=len(finite),
+        _token_nmse=token_nmse,
+    )
+    return result
+
+
+def error_stats(ref, actual, *, per_token=True):
     r, a = ref.double(), actual.double()
-    if r.shape != a.shape or not torch.isfinite(a).all() or not torch.isfinite(r).all():
+    if (
+        r.shape != a.shape
+        or not r.numel()
+        or not torch.isfinite(a).all()
+        or not torch.isfinite(r).all()
+    ):
         raise ValueError("invalid comparison tensors")
-    diff = a - r
-    sse = diff.square().sum()
-    energy = r.square().sum()
-    per_token = diff.square().sum(-1) / (r.square().sum(-1) + 1e-30)
-    denom = r.norm() * a.norm()
-    return dict(
-        nmse=(sse / (energy + 1e-30)).item(),
-        sse=sse.item(),
-        reference_energy=energy.item(),
-        max_abs=diff.abs().max().item(),
-        mean_abs=diff.abs().mean().item(),
-        rmse=diff.square().mean().sqrt().item(),
-        cosine=((r * a).sum() / denom).item() if denom else None,
-        **{f"token_nmse_{k}": v for k, v in summary(per_token).items() if k != "mean"},
+    squared = (a - r).square()
+    per_energy = r.square().sum(-1)
+    token_nmse = (
+        torch.where(per_energy > 0, squared.sum(-1) / per_energy, torch.nan).numpy()
+        if per_token
+        else None
+    )
+    return metric_values(
+        squared.sum().item(), per_energy.sum().item(), r.numel(), token_nmse
     )
 
 
@@ -52,12 +77,14 @@ def replay(x, weights, quantized, mode, dtype=torch.bfloat16):
 
     def linear(value, index):
         value = value.to(dtype)
-        rounded = qdq(value, activation=True)
-        records.append(
-            dict(
-                projection=PROJECTIONS[index], applied=aq, **error_stats(value, rounded)
+        if aq:
+            rounded = qdq(value, activation=True)
+            records.append(
+                dict(
+                    projection=PROJECTIONS[index],
+                    **error_stats(value, rounded, per_token=False),
+                )
             )
-        )
         w = (quantized if wq else weights)[index].to(dtype)
         return F.linear(rounded if aq else value, w)
 
@@ -68,30 +95,25 @@ def replay(x, weights, quantized, mode, dtype=torch.bfloat16):
 
 
 @torch.no_grad()
-def evaluate(z, z_gamma, gamma, weights, dtype=torch.bfloat16):
+def prepare_weights(gamma, weights):
     rot = rotation(gamma.numel())
     branches = {
         "A": weights,
         "B": [transform(w, gamma, p) for w, p in zip(weights, PROJECTIONS)],
         "C": [transform(w, gamma, p, True) for w, p in zip(weights, PROJECTIONS)],
     }
+    return rot, {b: (ws, [qdq(w) for w in ws]) for b, ws in branches.items()}
+
+
+@torch.no_grad()
+def evaluate(z, z_gamma, gamma, weights, dtype=torch.bfloat16, *, prepared=None):
+    rot, branches = (
+        prepared if prepared is not None else prepare_weights(gamma, weights)
+    )
     inputs = {"A": z_gamma, "B": z, "C": rot.apply(z.float()).to(z.dtype)}
-    outputs, activations, weight_rows = [], [], []
+    outputs, activations = [], []
     common = None
-    for branch, ws in branches.items():
-        quantized = [qdq(w) for w in ws]
-        for p, w, q in zip(PROJECTIONS, ws, quantized):
-            # Weight matrices are not tokens; only NMSE is required here.
-            weight_rows.append(
-                dict(
-                    branch=branch,
-                    projection=p,
-                    nmse=(
-                        (q.double() - w.double()).square().sum()
-                        / (w.double().square().sum() + 1e-30)
-                    ).item(),
-                )
-            )
+    for branch, (ws, quantized) in branches.items():
         own = None
         for mode in MODES:
             y, acts = replay(inputs[branch], ws, quantized, mode, dtype)
@@ -111,17 +133,125 @@ def evaluate(z, z_gamma, gamma, weights, dtype=torch.bfloat16):
                 )
             )
             activations.extend(dict(branch=branch, mode=mode, **r) for r in acts)
-    return outputs, activations, weight_rows
+    return outputs, activations
 
 
-def run(checkpoint, capture, output, dtype=torch.bfloat16, *, synthetic=False):
+def select_tokens(capture, entry, gamma, seen_samples, max_tokens=512):
+    """Validate the full expert archive; choose by identity, never file/rank order."""
+    if max_tokens < 0 or 0 < max_tokens < 128:
+        raise ValueError("max_replay_tokens must be 0 or >=128")
+    identities, candidates = set(), []
+    layer, expert = entry["layer"], entry["expert"]
+    for part_index, part in enumerate(entry["parts"]):
+        data, positions = read_part(capture, part)
+        if not torch.equal(data["gamma"], gamma):
+            raise ValueError("captured gamma mismatch")
+        if identities.intersection(positions):
+            raise ValueError("duplicate token identity")
+        if any((layer, sample) not in seen_samples for sample, _ in positions):
+            raise ValueError("token outside sample coverage")
+        identities.update(positions)
+        candidates.extend(
+            (token_priority(layer, expert, sample, pos), sample, pos, part_index, i)
+            for i, (sample, pos) in enumerate(positions)
+        )
+    if len(candidates) != entry["available"] or entry["retained"] != entry["available"]:
+        raise ValueError("lost/truncated archive tokens")
+    if len(candidates) < 128:
+        raise ValueError("insufficient routed tokens: requires at least128")
+    return heapq.nsmallest(max_tokens, candidates) if max_tokens else sorted(candidates)
+
+
+def archive_batches(capture, entry, chosen, hidden, batch_size=512):
+    """Only one replay batch and one mmap-backed archive block at a time."""
+    for offset in range(0, len(chosen), batch_size):
+        rows = chosen[offset : offset + batch_size]
+        z = torch.empty(len(rows), hidden, dtype=torch.bfloat16)
+        zg = torch.empty_like(z)
+        by_part = {}
+        for dest, (_, _, _, part, row) in enumerate(rows):
+            by_part.setdefault(part, []).append((dest, row))
+        for part, indexes in by_part.items():
+            data = load_file(str(Path(capture) / entry["parts"][part]["file"]))
+            dest, src = zip(*indexes)
+            z[list(dest)] = data["z"][list(src)]
+            zg[list(dest)] = data["z_gamma"][list(src)]
+        yield z, zg
+
+
+def combine_batches(rows, keys, prefixes):
+    groups = {}
+    for row in rows:
+        groups.setdefault(tuple(row[k] for k in keys), []).append(row)
+    result = []
+    for values, items in groups.items():
+        out = dict(zip(keys, values))
+        out["tokens"] = sum(r["tokens"] for r in items)
+        for prefix in prefixes:
+            stats = metric_values(
+                sum(r[prefix + "sse"] for r in items),
+                sum(r[prefix + "reference_energy"] for r in items),
+                sum(r[prefix + "elements"] for r in items),
+                np.concatenate([r[prefix + "_token_nmse"] for r in items])
+                if prefix + "_token_nmse" in items[0]
+                else None,
+            )
+            stats.pop("_token_nmse", None)
+            out.update({prefix + k: v for k, v in stats.items()})
+        result.append(out)
+    return result
+
+
+def summarize(rows, keys, prefixes):
+    groups = {}
+    for row in rows:
+        groups.setdefault(tuple(row[k] for k in keys), []).append(row)
+    results = []
+    for values, items in groups.items():
+        out = dict(
+            zip(keys, values),
+            experts=len(items),
+            tokens=sum(r["tokens"] for r in items),
+        )
+        for prefix in prefixes:
+            sse = sum(r[prefix + "sse"] for r in items)
+            energy = sum(r[prefix + "reference_energy"] for r in items)
+            elements = sum(r[prefix + "elements"] for r in items)
+            nmse = [r[prefix + "nmse"] for r in items]
+            out.update(
+                {
+                    prefix + "pooled_mse": sse / elements,
+                    prefix + "pooled_nmse": ratio(sse, energy),
+                    prefix + "mean_expert_nmse": sum(nmse) / len(nmse)
+                    if all(v is not None for v in nmse)
+                    else None,
+                    prefix + "sse": sse,
+                    prefix + "reference_energy": energy,
+                    prefix + "elements": elements,
+                }
+            )
+        results.append(out)
+    return results
+
+
+def run(
+    checkpoint,
+    capture,
+    output,
+    dtype=torch.bfloat16,
+    *,
+    synthetic=False,
+    max_replay_tokens=512,
+):
+    if max_replay_tokens < 0 or 0 < max_replay_tokens < 128:
+        raise ValueError("max_replay_tokens must be 0 or >=128")
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
-    result = dict(status="running", outputs=[], activations=[], weights=[])
+    result = dict(status="running", outputs=[], activations=[], replay_selection=[])
     atomic_json(output / "results.json", result)
     try:
         capture = Path(capture)
-        manifest = json.loads((capture / "capture_manifest.json").read_text())
+        manifest = read_manifest(capture)
         selection = {int(k): v for k, v in manifest["selection"].items()}
         if manifest["status"] != "complete" or (
             not synthetic
@@ -130,35 +260,29 @@ def run(checkpoint, capture, output, dtype=torch.bfloat16, *, synthetic=False):
             raise ValueError("requires complete real capture with exact E1.3 selection")
         cp = Checkpoint(checkpoint, [], 0, 1234)
         cp.select(list(selection), 3, 1234, selections=selection)
-        index_hash = hashlib.sha256(cp.index_path.read_bytes()).hexdigest()
         if not synthetic and (
-            manifest["source"].get("checkpoint_index_sha256") != index_hash
+            manifest["source"].get("checkpoint_index_sha256")
+            != file_hash(cp.index_path)
             or manifest["source"].get("checkpoint_config_sha256")
-            != hashlib.sha256(
-                (Path(checkpoint) / "config.json").read_bytes()
-            ).hexdigest()
+            != file_hash(Path(checkpoint) / "config.json")
             or manifest["source"].get("routing_alignment_verified") is not True
         ):
             raise ValueError("capture checkpoint/alignment mismatch")
-        expected = {(layer_id, e) for layer_id, ids in selection.items() for e in ids}
-        actual = [(e["layer"], e["expert"]) for e in manifest["experts"]]
-        if len(actual) != len(set(actual)) or set(actual) != expected:
-            raise ValueError("capture expert set mismatch")
         result.update(
             provenance=provenance(),
-            capture_manifest_sha256=hashlib.sha256(
-                (capture / "capture_manifest.json").read_bytes()
-            ).hexdigest(),
+            source=manifest["source"],
+            capture_manifest_sha256=file_hash(capture / "capture_manifest.json"),
             data_kind=manifest["source"]["kind"],
             arithmetic=str(dtype),
             selection=selection,
-            activation_quantization="CT dynamic per-token per-32 input group",
-            reference="Original A FP, unweighted expert output",
+            reference="Original A FP, unweighted expert output; C inverse-rotated",
             configuration=dict(
                 checkpoint=str(checkpoint),
                 capture=str(capture.resolve()),
-                rotation_block_size=32,
+                max_replay_tokens=max_replay_tokens,
+                replay_batch_size=512,
                 seed=1234,
+                rotation_block_size=32,
                 transform_precision="float32",
                 weight_writeback="bfloat16",
                 quantization="CT MXFP4 E2M1/E8M0",
@@ -166,50 +290,38 @@ def run(checkpoint, capture, output, dtype=torch.bfloat16, *, synthetic=False):
                 axis=-1,
                 weights="static minmax",
                 activations="dynamic per token/group minmax",
+                zero_reference_energy="NMSE null; token quantiles over defined NMSE "
+                "only",
             ),
             experiment_source_sha256={
-                p.name: hashlib.sha256(p.read_bytes()).hexdigest()
-                for p in Path(__file__).parent.glob("*.py")
+                p.name: file_hash(p) for p in Path(__file__).parent.glob("e2*.py")
             },
         )
         for entry in manifest["experts"]:
             layer, expert = entry["layer"], entry["expert"]
-            path = (capture / entry["file"]).resolve()
-            if (
-                not path.is_relative_to(capture.resolve())
-                or hashlib.sha256(path.read_bytes()).hexdigest() != entry["sha256"]
-            ):
-                raise ValueError("capture path/hash mismatch")
-            data = load_file(str(path))
-            if any(data[k].dtype != torch.bfloat16 for k in ("z", "z_gamma", "gamma")):
-                raise ValueError("capture must preserve original BF16 tensors")
-            if not all(torch.isfinite(t).all() for t in data.values()):
-                raise ValueError("nonfinite capture")
-            n = len(data["z"])
-            if data["router_weight"].shape != (n,) or (data["router_weight"] < 0).any():
-                raise ValueError("invalid captured router weights")
-            if (
-                n < (manifest["minimum"] if synthetic else 128)
-                or n > 512
-                or n != entry["retained"]
-            ):
-                raise ValueError("insufficient/mismatched token count")
             gamma = cp.load(f"model.layers.{layer}.post_attention_layernorm.weight")
-            if not torch.equal(gamma, data["gamma"]):
-                raise ValueError("captured gamma mismatch")
-            if (
-                data["z"].shape != data["z_gamma"].shape
-                or data["z"].shape[1] != gamma.numel()
-            ):
-                raise ValueError("capture shape mismatch")
-            positions = list(
-                zip(data["sample_id"].tolist(), data["token_position"].tolist())
+            chosen = select_tokens(
+                capture,
+                entry,
+                gamma,
+                set(map(tuple, manifest["seen_samples"])),
+                max_replay_tokens,
             )
-            if (
-                len(set(positions)) != n
-                or [list(p) for p in positions] != entry["sample_positions"]
-            ):
-                raise ValueError("token identity mismatch")
+            positions = [[r[1], r[2]] for r in chosen]
+            selection_info = dict(
+                layer=layer,
+                expert=expert,
+                available_tokens=entry["available"],
+                replay_tokens=len(chosen),
+                token_identity_sha256=hashlib.sha256(
+                    json.dumps(positions, separators=(",", ":")).encode()
+                ).hexdigest(),
+            )
+            # Small default selection is inspectable. All-token runs retain only a
+            # fingerprint; identities remain in the full server archive.
+            if max_replay_tokens:
+                selection_info["sample_positions"] = positions
+            result["replay_selection"].append(selection_info)
             ws = [cp.load(cp.key(layer, expert, p)) for p in PROJECTIONS]
             if not synthetic:
                 for p, w in zip(PROJECTIONS, ws):
@@ -217,118 +329,86 @@ def run(checkpoint, capture, output, dtype=torch.bfloat16, *, synthetic=False):
                         w.contiguous().view(torch.uint8).numpy().tobytes()
                     ).hexdigest()
                     if (
-                        manifest.get("expert_weight_sha256", {}).get(
-                            cp.key(layer, expert, p)
-                        )
+                        manifest["expert_weight_sha256"].get(cp.key(layer, expert, p))
                         != digest
                     ):
                         raise ValueError("captured expert weight identity mismatch")
-            out, act, weight = evaluate(data["z"], data["z_gamma"], gamma, ws, dtype)
-            for key, rows in [
-                ("outputs", out),
-                ("activations", act),
-                ("weights", weight),
-            ]:
-                result[key].extend(dict(layer=layer, expert=expert, **r) for r in rows)
-            print(f"layer={layer} expert={expert} tokens={n} complete", flush=True)
-        aggregate = []
-        for layer in selection:
-            for branch in "ABC":
-                for mode in MODES:
-                    rows = [
-                        r
-                        for r in result["outputs"]
-                        if (r["layer"], r["branch"], r["mode"]) == (layer, branch, mode)
-                    ]
-                    tokens = sum(r["tokens"] for r in rows)
-                    aggregate.append(
-                        dict(
-                            layer=layer,
-                            branch=branch,
-                            mode=mode,
-                            experts=len(rows),
-                            tokens=tokens,
-                            mean_nmse=float(np.mean([r["common_nmse"] for r in rows])),
-                            token_weighted_nmse=sum(
-                                r["common_nmse"] * r["tokens"] for r in rows
-                            )
-                            / tokens,
-                            pooled_nmse=sum(r["common_sse"] for r in rows)
-                            / (sum(r["common_reference_energy"] for r in rows) + 1e-30),
-                        )
+            prepared = prepare_weights(gamma, ws)
+            outs, acts = [], []
+            for z, zg in archive_batches(capture, entry, chosen, gamma.numel()):
+                out, act = evaluate(z, zg, gamma, ws, dtype, prepared=prepared)
+                outs.extend(out)
+                acts.extend(dict(r, tokens=len(z)) for r in act)
+            for table, rows, keys, prefixes in (
+                ("outputs", outs, ("branch", "mode"), ("common_", "branch_fp_")),
+                ("activations", acts, ("branch", "mode", "projection"), ("",)),
+            ):
+                result[table].extend(
+                    dict(
+                        layer=layer,
+                        expert=expert,
+                        available_tokens=entry["available"],
+                        **r,
                     )
-        result["layer_summary"] = aggregate
-        associations = []
-        for branch in "ABC":
-            for mode in ("W4A16", "W16A4", "W4A4"):
-                for projection in PROJECTIONS:
-                    ys = [
-                        r
-                        for r in result["outputs"]
-                        if r["branch"] == branch and r["mode"] == mode
-                    ]
-                    for kind, table in (
-                        ("weight", result["weights"]),
-                        ("activation", result["activations"]),
-                    ):
-                        xs = {
-                            (r["layer"], r["expert"]): r["nmse"]
-                            for r in table
-                            if r["branch"] == branch
-                            and r["projection"] == projection
-                            and (kind == "weight" or r["mode"] == mode)
-                        }
-                        associations.append(
-                            dict(
-                                branch=branch,
-                                mode=mode,
-                                projection=projection,
-                                kind=kind,
-                                **corr(
-                                    [xs[(r["layer"], r["expert"])] for r in ys],
-                                    [r["common_nmse"] for r in ys],
-                                ),
-                            )
-                        )
-        result["associations"] = associations
-        write_csv(output / "associations.csv", associations)
-        for key in ("weights", "activations", "outputs", "layer_summary"):
+                    for r in combine_batches(rows, keys, prefixes)
+                )
+            del prepared, ws, outs, acts
+            print(
+                f"layer={layer} expert={expert} available={entry['available']} "
+                f"replay={len(chosen)}",
+                flush=True,
+            )
+        result["layer_summary"] = summarize(
+            result["outputs"], ("layer", "branch", "mode"), ("common_", "branch_fp_")
+        )
+        result["activation_summary"] = summarize(
+            result["activations"], ("layer", "projection", "branch", "mode"), ("",)
+        )
+        for key in ("activations", "outputs", "activation_summary", "layer_summary"):
             write_csv(output / f"{key}.csv", result[key])
-        atomic_json(output / "capture_manifest.json", manifest)
         lines = [
-            "# E2 local expert reconstruction",
+            "# E2 expert reconstruction",
             "",
             f"Source: {result['data_kind']}; arithmetic: {dtype}.",
-            "All errors use common original A-FP coordinates; C is inverse-rotated.",
-            "FP rows expose transform rounding. Inspect branch_fp errors separately.",
-            "W4A16 and W16A4 are switch controls, not additive causal contributions.",
-            "Activation QDQ errors with applied=False are diagnostic only.",
+            "Common reference is original A FP; C outputs are inverse-rotated.",
+            "Branch-FP errors separately expose quantization vs transform rounding.",
+            "Activation metrics include only W16A4/W4A4 actual QDQ inputs.",
+            "Pooled MSE = total SSE/elements; pooled NMSE = total "
+            "SSE/reference energy.",
+            "Mean Expert NMSE is the arithmetic mean of expert NMSE, a "
+            "different measure.",
             "",
-            "|Layer|Mode|A mean NMSE|B mean NMSE|C mean NMSE|C/B gain %|C/A gain %|",
+            "|Layer|Mode|A pooled NMSE|B pooled NMSE|C pooled NMSE|C/B gain "
+            "%|C/A gain %|",
             "|---|---|---|---|---|---|---|",
         ]
         for layer in selection:
             for mode in MODES:
-                nmse = {
-                    r["branch"]: r["mean_nmse"]
-                    for r in aggregate
+                ns = {
+                    r["branch"]: r["common_pooled_nmse"]
+                    for r in result["layer_summary"]
                     if r["layer"] == layer and r["mode"] == mode
                 }
 
                 def gain(b):
-                    return 100 * (nmse[b] - nmse["C"]) / nmse[b] if nmse[b] else None
+                    return (
+                        100 * (ns[b] - ns["C"]) / ns[b]
+                        if ns[b] and ns["C"] is not None
+                        else None
+                    )
 
                 lines.append(
-                    f"|{layer}|{mode}|{nmse['A']:.6g}|{nmse['B']:.6g}|"
-                    f"{nmse['C']:.6g}|{gain('B')}|{gain('A')}|"
+                    f"|{layer}|{mode}|{ns['A']}|{ns['B']}|{ns['C']}|{gain('B')}|{gain('A')}|"
                 )
         lines += [
             "",
-            "Positive gains indicate lower common-reference output error.",
-            "No routing weights are applied. Unequal token counts are reported; pooled",
-            "and token-weighted NMSE are separate columns in layer_summary.csv.",
-            "No downstream accuracy or selective rotation is evaluated.",
-            "Capture tensors remain in the input capture directory, not duplicated.",
+            "Positive gain means lower common-reference expert output NMSE.",
+            "Inspect W16A4 vs W4A16 to compare activation and weight "
+            "sensitivity; errors are not additive.",
+            "No downstream accuracy or selective-rotation conclusion follows "
+            "from this local reconstruction.",
+            "Full activations remain in the server archive; only this "
+            "six-file result directory needs sharing.",
         ]
         (output / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
         result["status"] = "complete"
@@ -347,9 +427,21 @@ def main():
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--arithmetic", choices=["bfloat16", "float32"], default="bfloat16")
     p.add_argument("--threads", type=int, default=4)
+    p.add_argument(
+        "--max-replay-tokens",
+        type=int,
+        default=512,
+        help="0 replays all archived tokens; otherwise >=128",
+    )
     a = p.parse_args()
     torch.set_num_threads(a.threads)
-    run(a.checkpoint, a.capture, a.output, getattr(torch, a.arithmetic))
+    run(
+        a.checkpoint,
+        a.capture,
+        a.output,
+        getattr(torch, a.arithmetic),
+        max_replay_tokens=a.max_replay_tokens,
+    )
 
 
 if __name__ == "__main__":

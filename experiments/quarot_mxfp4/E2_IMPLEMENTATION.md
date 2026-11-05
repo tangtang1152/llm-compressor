@@ -1,7 +1,7 @@
 # E2 real-activation expert reconstruction
 
 Implemented: data/tokenizer preflight, an experimental sequential capture adapter
-using the historical distributed loader, bounded capture/shard merging, and CPU
+using the historical distributed loader, full sample-block capture/shard merging, and CPU
 A/B/C replay. No real checkpoint or NPU job was run here. Synthetic tests establish
 engineering properties, not QuaRot gains.
 
@@ -47,7 +47,7 @@ does not run a full model forward. Changed graph layouts fail explicitly.
 
 A tiny instance of the installed GlmMoeDsaRMSNorm with unit gain computes z using
 its actual forward. No division by gamma or mutation of the model norm. z*gamma
-is checked against actual norm output (rtol=atol=.01); max/mean/NMSE and epsilon
+is checked against actual norm output (rtol=atol=.01); MSE/NMSE and epsilon
 are recorded. Capture reductions use FP32 for NPU compatibility. Actual original
 z_gamma is stored directly, including BF16 rounding. Zero/negative gamma works.
 
@@ -59,19 +59,42 @@ duplicate or mismatched hooks fail. Onloaded expert weights are hashed once;
 hashes must agree across ranks and match the CPU replay checkpoint.
 
 Fixed selection: 3:[76,158,202], 6:[101,182,240], 16:[70,81,164], 40:[60,165,236].
-Each expert retains the 512 lowest SHA256 priorities of
-(seed1234,layer,expert,global_sample,token_position). Selection is independent of
-errors, input order and rank partition. Rank-local counts may be below128; only
-the merged global capture requires128. Shards merge one at a time with bounded
-reservoirs. Insufficient counts produce an incomplete manifest with actual counts;
-increase samples from the same source, rerun preflight and capture in new paths.
-No expert substitution or random filling.
+All valid originally routed tokens from the calibration samples are retained,
+without sampling, padding, lossy compression or random filling. Each sample/expert
+is a separate safetensors block: BF16 z/z_gamma/gamma, original router weight dtype,
+int64 global sample_id and token_position. The NPU driver's collector writes each
+block immediately; full activations are never held across all samples in RAM.
+Gamma is also represented losslessly as BF16-exact numeric values in the manifest,
+including layers/experts with zero routed tokens. Source/dataset/model/weight
+hashes and norm epsilon remain intact.
 
-Provenance includes model config/modeling source, software/source hashes,
-dataset/tokenized hashes, epsilon, sample positions, routing weight ranges,
-selected weight identities and capture file hashes. Failures leave failed/running
-rank status and no complete global capture. Torchrun supervises worker failures;
-abrupt death can leave running status/offload files. No automatic cleanup.
+Archive format 2 is explicitly marked all_routed_valid_tokens. Capped format 1
+archives are rejected as incomplete candidates for this full-archive workflow;
+no old files are rewritten. Previously discarded candidates cannot be recovered
+without recapture. Archives with fewer than 128 tokens remain valid raw archives,
+but E2 Replay fails explicitly for those experts.
+
+Merge validates every block's file hash, tensor dtype/shape/bytes, token identities,
+gamma and counts; rank global sample-ID sets must be disjoint, and all selected
+layers must cover every sample in each partition. Global coverage must equal the
+preflight sample IDs. For every expert, retained == sum(rank available) == unique
+token count == sum(block token counts). Loss/truncation/duplicates cannot produce
+a complete manifest. Merge copies one block at a time and verifies the copied hash.
+
+Only after the full archive is verified and marked complete are temporary rank
+shards removed. Cleanup is restricted to the explicitly supplied sibling shard
+directories with exactly the verified manifest/block file set; links, junctions
+and unexpected files are rejected. A merge failure preserves every original shard
+and marks the new destination incomplete. Cleanup failure is reported separately:
+the verified final archive remains complete, cleanup_status=failed, remaining
+shards are preserved and the driver reports failure. Final archives, unrelated
+files, offload directories and historical results are never deleted.
+
+The source retains config/modeling/software hashes, data/tokenized hashes,
+epsilon, positions, original routing weights, selected weight identities and
+block hashes. Abrupt worker termination can leave incomplete shard files; no
+complete manifest is emitted before dispatch verification. Torchrun supervises
+worker failures. Original route alignment checks and stop boundary are unchanged.
 
 ## Replay and metrics
 
@@ -80,76 +103,100 @@ down. C: BF16(zQ), fused/input-rotated gate/up and output-rotated down. Uses exi
 transform(), HadamardRotation B32 seed1234, FP32 transforms and BF16 write-back.
 C outputs pass through inverse_hidden before comparison.
 
-All FP/W4A16/W16A4/W4A4 outputs share the **same original A FP reference** and also
-report errors against their own branch FP. B/C FP common-reference errors expose
-transform/input/coordinate-write-back rounding. Primary outputs are unweighted;
-router weights are retained, not reapplied or recomputed. Gate/up/down input QDQ
-is enabled only by the activation switch. Down input always comes from that
-mode's actual SiLU(gate)*up computation.
+All FP/W4A16/W16A4/W4A4 outputs share the **same original A FP reference** and
+also report MSE/NMSE against their branch FP. B/C FP common-reference errors expose
+transform/write-back rounding. Router weights are preserved but not applied to
+primary Expert output metrics. Gate/up/down activation errors are computed only
+when QDQ is actually applied (W16A4 and W4A4). Down input comes from that mode's
+actual SiLU(gate)*up result. FP/W4A16 do not perform hypothetical activation QDQ.
 
-CT MXFP4 E2M1/E8M0 group32 axis=-1 is retained. Static weight QDQ still uses
-MemorylessMinMaxObserver and is cached once per representation. Activation QDQ
-uses CT compute_dynamic_scales_and_zp + fake_quantize, with scales shaped
-[tokens,input_dim/32]. The previous experimental helper used a static observer
-for activations, which could reduce token/group axes. Correcting that helper
-restores native dynamic semantics; production quantization and E1 weight QDQ are
-unchanged.
+Static CT weight QDQ and existing transforms are unchanged. Weight NMSE tables,
+correlations, associations.csv, max/mean absolute error, RMSE, cosine and P90/P99
+are removed. Activation rows contain MSE/NMSE and their SSE/element/energy audit
+terms. Output rows retain both common and branch-FP MSE/NMSE plus per-token NMSE
+P50/P95. All metric reductions use FP64 on CPU.
 
-Default replay arithmetic is BF16. --arithmetic float32 is a separate diagnostic:
-stored BF16 transformed weights are QDQ'd before promotion; intermediate inputs
-and activation QDQ then use FP32. Do not combine these runs. CPU error reductions
-use FP64. Activation records with applied=False describe hypothetical QDQ error,
-not a perturbation to the actual computation.
+Definitions (never interchanged):
 
-## Resource budget
+- Matrix MSE = SSE / elements; NMSE = SSE / reference energy.
+- Pooled MSE = sum(SSE) / sum(elements).
+- Pooled NMSE = sum(SSE) / sum(reference energy).
+- Mean Expert NMSE = arithmetic mean of the expert NMSE values.
 
-- Final z/z_gamma at hidden6144 and512 tokens: ~12 MiB/expert, ~144 MiB for12 experts.
-  Routing/manifest metadata is small. Retained audit shards add up to8*144 MiB for
-  eight ranks: **~1.27 GiB total activation payload**, including final capture.
-  Replay does not duplicate tensor files. Rank files are not automatically removed.
-- Each rank retains a bounded ~144 MiB reservoir plus temporary replacements.
-  Norm/router tensors live only in the same subgraph/batch; pending Expert checks
-  retain hashes rather than tensors across batches. Candidate transfers are batched.
-- A2688x6144 BF16 tensor is31.5 MiB. Intermediate caches, residuals, attention masks,
-  DSA temporaries and allocators are additional and can dominate. Full loader
-  host/shared-memory/disk backing remains in the historical TB class: stopping at
-  Layer40 does not avoid loading backing for the checkpoint. Small capture files
-  do not imply a small model load.
-- One6144x2048 expert's three BF16 weights total72 MiB; A/B/C plus a cached QDQ
-  representation use288 MiB, plus FP32/FP64 temporaries. Allow several GiB CPU RAM
-  for replay. Real peak RAM/VRAM/offload volume/runtime are **unmeasured**.
-- Check free/cgroup memory, /dev/shm, free offload disk and placement limits before
-  loading. Do not blindly reuse historical available-memory figures or change mounts.
-  Historical versions: torch2.10.0, torch-npu2.10.0.post4, transformers5.14.1,
-  compressed-tensors0.17.0, accelerate1.14.0, safetensors0.8.0. Record the current
-  server environment and run its local-size tests before L4.
+Zero reference energy gives null NMSE. Output token quantiles use defined token
+NMSE values, with token_nmse_defined recording their count; all-undefined quantiles
+are null. Mean Expert NMSE is null if any expert is undefined, rather than silently
+omitting experts. NumPy linear quantiles are computed from exact per-token vectors
+within the current expert, never by averaging batch percentiles.
 
-## Local validation and remaining limits
+### Replay sampling is independent of archival retention
 
-2026-11-05: `python -m pytest experiments/quarot_mxfp4 -q -p no:cacheprovider`
-passed **25 tests in15.04s**; Ruff check passed. Capture/replay CLI --help passed.
+--max-replay-tokens defaults to 512. It selects the lowest SHA256 priorities of
+(seed1234,layer,expert,global_sample,token_position), with identity tie-breaking,
+independent of file/rank ordering. Values 1..127 and negatives are rejected; 0 uses
+all archived tokens. Fewer than 128 available tokens fails. A/B/C use the exact
+same selected identities; there is no per-branch resampling.
 
-Synthetic replay: two layers x three experts x128 tokens;72 output,54 weight and216
-activation records. A FP reference error is zero. FP32 transform algebra errors
-<1e-10; synthetic BF16 branch FP NMSE <0.003. These are fixture properties, not real
-model bounds. Tests cover mode switches, dynamic group/token scale granularity,
-inverse direction, actual quantized down input, deterministic selection, insufficient
-counts, corruption, failure status, no overwrite, zero/negative gamma and absent
-graph boundaries.
+results.json records available_tokens, replay_tokens, seed and a selection hash
+per expert. Default selections also include positions; all-token runs store only
+the hash/counts in results, with identities retained on the server. All-token
+replay runs in batches of 512, with transformed/QDQ weights cached once per expert;
+SSE/energy/elements aggregate exactly and output token vectors remain limited to
+the current expert. Original activations are validated block-by-block before use.
+Default arithmetic is BF16; --arithmetic float32 remains a separate diagnostic.
 
-A separate actual Tiny GlmMoeDsaForCausalLM test uses original routing, two selected
-MoE layers/four experts per layer/two samples including padding. Sequential captures
-match direct original-model captures bit-for-bit; simulated rank shards merge to
-identical selections/tensors; overlap fails; hooks prove the next decoder and LM
-head are not executed. This exercises the real model class and sequential engine.
+## Archive size and resource budget
 
-**Unverified:** real checkpoint load, NPU/HCCL multiprocess behavior, server data/
-tokenizer identity, full-size graph/resource use and research results. A local
-attempt to test load_context + auto_offload on a saved tiny checkpoint failed in
-Transformers monkey_patching.apply_patches importing an unrelated Aria optional
-module: missing torchvision. No loader success is claimed and no fake bypass was
-added. Constructor/linearize/sequential tests are independent. Check/resolve the
-server environment before L4.
+For hidden H, each routed expert-token contributes 4*H bytes for z/z_gamma,
+16 bytes for the two int64 identifiers, plus router_weight.element_size() bytes.
+Gamma copies, safetensors headers and manifests are additional. With H=6144 and
+FP32 router weights this is 24596 bytes/token. Total size depends on actual routing,
+not the 512-token replay limit.
+
+At the historical 91834 valid tokens, **if** top-k=8 among 256 experts and routing
+were uniform, the 12 selected experts would receive about 34438 token assignments:
+about 0.79 GiB plus gamma/headers. This is a planning assumption, not a measurement.
+A conservative bound allowing every valid token to reach all three selected
+experts in each of four layers is 1102008 assignments, about 25.24 GiB plus metadata.
+Budget up to twice the archive size during validated copy/merge; temporary rank
+shards are deleted only after success. Model offload space is entirely additional.
+
+Manifest tensor_bytes measures numeric tensor payload; archive_file_bytes sums
+actual safetensors file sizes including headers. The manifest JSON itself is not
+included in those counters. Use the query below or du for the full directory size.
+No real archive size is measured locally. CPU fixtures are small and their actual
+sizes are reported separately from these server estimates.
+
+Memory: streaming capture/merge holds one sample/expert block at a time plus identity
+sets and existing sequential caches. Replay holds one 512-token batch, one mmap-backed
+archive block and one expert's metadata/per-token vectors. Static BF16 raw/fused/
+rotated and QDQ weights total about 432 MiB for 6144x2048 experts, with additional
+FP32/FP64 temporaries. Allow several GiB for CPU replay. Original model loading,
+shared memory and attention/DSA intermediates still require the historical large
+server allocation; this change does not make the full loader small. Peak server
+RAM/VRAM, disk throughput and runtime remain unmeasured.
+
+## Local verification and limits
+
+2026-11-05 validation: the full experiment-directory Pytest suite passed 34 tests;
+Ruff passed. The full-capture CPU fixture has 6 experts x 640 retained tokens at
+hidden 64, with 1,053,696 numeric bytes, 1,058,880 safetensors bytes, and1,065,645 total
+archive file bytes including the manifest (~1.02 MiB). Its verified temporary rank
+shards were removed. Replay used 512 tokens/expert by default and 640 with limit 0.
+These are actual synthetic fixture measurements, not a real GLM archive estimate.
+
+Tests include full capture above 512 tokens in one sample, multirank merge counts
+and identity/tensor equality, deterministic 512-token replay, all-token replay
+across batch boundaries, common and branch references, actual quantized down input,
+QDQ mode switches, known MSE/NMSE/pooled definitions, corruption, missing/overlapping
+partitions, duplicate tokens, and successful-only shard cleanup. The actual Tiny
+GLM sequential-vs-direct capture test is retained, including padding and stopping
+before the next decoder/LM head. Original E1/E1.2/E1.3 sources are unchanged.
+
+Real checkpoint loading/NPU/HCCL, current server data/tokenizer identity and research
+results remain unverified here. The previous full tiny-loader attempt was blocked
+by a missing optional torchvision dependency during Transformers imports; no loader
+bypass is introduced by this refactor. No real server experiment was started.
 
 ## Server commands (not executed here)
 
@@ -188,7 +235,8 @@ The sample offload path is shared storage: use the prior validated faster backin
 filesystem if available. Offload and result directories must both be new.
 
 L4 passes only if every rank status and the global capture are complete, all three
-exact Layer3 experts retain128..512 tokens, norm errors pass, actual-dispatch checks
+exact Layer3 experts retain every available token and have at least 128 for replay,
+norm errors pass, actual-dispatch checks
 pass and resource use is within server limits. Inspect rank logs/counts. **Only
 then** run the four-layer local-expert capture and CPU replay:
 
@@ -202,34 +250,77 @@ torchrun --standalone --nproc-per-node=8 -m experiments.quarot_mxfp4.e2_collect 
 python -m experiments.quarot_mxfp4.e2 \
   --checkpoint /mnt/weight/GLM-5.2 \
   --capture "$BASE-capture/capture" \
-  --arithmetic bfloat16 --threads 4 --output "$BASE-replay"
+  --arithmetic bfloat16 --threads 4 --max-replay-tokens 512 \
+  --output "$BASE-replay"
 ```
 
 Replay requires the complete exact twelve-expert selection, not the single-layer
 gate. No full-model L5 is recommended. Synthetic captures are rejected by the CLI.
-All directories must be new. No plots, large per-token CSVs or automatic cleanup.
+All directories must be new. No plots or large per-token CSVs. Only verified temporary
+rank shards are cleaned after a successful full merge.
 
-## Outputs and interpretation
+## Server archive query and files to share
 
-Capture: per-rank status JSON and rank shards; capture/capture_manifest.json and
-capture/captured_activations/*.safetensors. Only a complete global manifest denotes
-success; incomplete/rank-only files cannot be replayed as real results.
+The final raw archive is `$BASE-capture/capture/`. It contains the manifest and
+sample blocks under captured_activations/. It is reusable and never deleted by
+Replay. Temporary rankN/ directories disappear only after successful merge.
 
-Replay: results.json (configuration/provenance/scalars), a reference copy of the
-capture manifest, weights.csv, activations.csv, outputs.csv, layer_summary.csv,
-associations.csv, summary.md. Tensor paths remain relative to the original capture
-directory recorded in results. Full runs contain144 output,108 weight and432
-activation rows. Metrics include NMSE/max/mean/RMSE/per-token P50/P90/P95/P99 and
-cosine (null for zero denominator). Mean-expert, token-weighted and energy-pooled
-NMSE are distinct columns.
+Inspect counts and actual file sizes without reading/printing activation values:
 
-Use W4A4 C/B and C/A gains for both baselines. W16A4 versus W4A16 distinguishes
-activation and weight sensitivity; FP and branch_fp errors expose transform
-rounding. Associations compare projection weight/activation NMSE to common output
-NMSE across experts. These are small, dependent, exploratory correlations. SiLU,
-gate/up multiplication and down introduce interactions; errors cannot be added.
-No real net-benefit/accuracy/selective-rotation conclusion follows from synthetic
-tests. No layer-skip implementation is included.
+```bash
+CAPTURE="$BASE-capture/capture"
+python - "$CAPTURE" <<'PY'
+import json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+m = json.loads((root / "capture_manifest.json").read_text())
+print("status", m["status"], "cleanup", m.get("cleanup_status"))
+for e in m["experts"]:
+    print("layer", e["layer"], "expert", e["expert"],
+          "available", e["available"], "retained", e["retained"],
+          "parts", len(e["parts"]))
+print("numeric payload bytes", m["tensor_bytes"])
+print("safetensors file bytes", m["archive_file_bytes"])
+print("all directory file bytes", sum(p.stat().st_size for p in root.rglob("*") if p.is_file()))
+PY
+du -sh "$CAPTURE"
+```
+
+For future server-side exploration, use `read_manifest(root)` and
+`read_part(root, entry["parts"][i])` from e2_capture; they validate the block hash,
+dtype and identity counts. Each block returns z/z_gamma/gamma, original router
+weights and sample/position tensors. Do not transmit these raw arrays to chat.
+
+To expand replay without reloading the model, use a fresh result directory:
+
+```bash
+python -m experiments.quarot_mxfp4.e2 \
+  --checkpoint /mnt/weight/GLM-5.2 --capture "$CAPTURE" \
+  --max-replay-tokens 0 --threads 4 --output "$BASE-replay-all"
+```
+
+Replay outputs **only six files**:
+
+- results.json: configuration/provenance, archive reference, available/replay counts,
+  selection identities/hash and core results.
+- activations.csv: Layer/Expert/Branch/Mode/Projection MSE/NMSE, W16A4/W4A4 only.
+- outputs.csv: common-A and branch-FP MSE/NMSE plus token P50/P95.
+- activation_summary.csv: Layer/Projection/Branch/Mode pooled and mean-expert metrics.
+  Branch/mode remain separate so different controls are never pooled together.
+- layer_summary.csv: Layer/Branch/Mode pooled and mean-expert output metrics for both
+  references.
+- summary.md: core A/B/C comparisons and interpretation limits.
+
+A 12-expert run produces 144 output rows, 216 activation rows, 48 output-summary rows
+and 72 activation-summary rows, regardless of replay sample limit. Share these six
+small result files with ChatGPT; keep full activations, rank/offload files and model
+weights on the server. No Weight NMSE table, associations, copied capture manifest,
+large token table or figures are emitted into Replay results.
+
+W4A4 C/B and C/A gains answer the two baseline comparisons. W16A4 vs W4A16 measures
+activation vs weight sensitivity; transform rounding remains visible through the
+branch-FP reference. These interacting errors are not additive, and synthetic
+fixtures establish no real net-benefit, downstream accuracy or layer-skip conclusion.
 
 ## Safe Git sync
 
