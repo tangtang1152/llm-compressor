@@ -5,6 +5,7 @@ import math
 import torch
 from compressed_tensors.quantization.lifecycle.forward import fake_quantize
 from compressed_tensors.quantization.quant_scheme import MXFP4
+from compressed_tensors.quantization.utils import compute_dynamic_scales_and_zp
 from torch import nn
 from torch.nn import functional as F
 
@@ -50,8 +51,14 @@ def qdq(value, activation=False, *, return_params=False):
     if value.ndim != 2 or value.shape[-1] % 32 or not torch.isfinite(value).all():
         raise ValueError("expected finite matrix with input dimension divisible by 32")
     args = MXFP4["input_activations" if activation else "weights"].model_copy(deep=True)
-    obs = MemorylessMinMaxObserver("input" if activation else "weight", args)
-    params = obs(value).get_qparams()
+    if activation:
+        # GROUP dynamic scales must retain both token and group axes. The static
+        # observer reduces its observation axis and is not the CT dynamic path.
+        scale, zero_point = compute_dynamic_scales_and_zp(value, args, nn.Identity())
+        params = dict(scale=scale, zero_point=zero_point)
+    else:
+        obs = MemorylessMinMaxObserver("weight", args)
+        params = obs(value).get_qparams()
     result = fake_quantize(value, args=args, **params)
     return (result, params) if return_params else result
 
@@ -94,13 +101,13 @@ def metrics(reference, actual):
 
 def expert(x, weights, mode="float"):
     """Minimal replay interface: x is already normed in this branch's coordinates."""
-    if mode not in ("float", "W4A16", "W4A4"):
+    if mode not in ("float", "W4A16", "W16A4", "W4A4"):
         raise ValueError(mode)
 
     def linear(x, w):
         return F.linear(
-            qdq(x, True) if mode == "W4A4" else x,
-            (qdq(w) if mode != "float" else w).to(x.dtype),
+            qdq(x, True) if mode in ("W16A4", "W4A4") else x,
+            (qdq(w) if mode in ("W4A16", "W4A4") else w).to(x.dtype),
         )
 
     gate, up, down = weights
