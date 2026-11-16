@@ -40,11 +40,17 @@ class NormFusion:
 class RotationPlan:
     spaces: tuple[RotationSpace, ...]
     fusions: tuple[NormFusion, ...]
-    embedding: WeightRotation
+    embedding: WeightRotation | None
     rotations: tuple[WeightRotation, ...]
 
+    @property
+    def operations(self) -> tuple[WeightRotation, ...]:
+        return (() if self.embedding is None else (self.embedding,)) + self.rotations
 
-def build_glm_plan(model: nn.Module) -> RotationPlan:
+
+def build_glm_plan(
+    model: nn.Module, enabled_rotation_spaces: tuple[str, ...] | None = None
+) -> RotationPlan:
     """Resolve every consumer and validate shapes before any mutation can occur.
 
     Supports bias-free RMSNorm, positive q_lora_rank, explicit unsharded experts
@@ -199,9 +205,24 @@ def build_glm_plan(model: nn.Module) -> RotationPlan:
         for name in consumers:
             add(name, "rot", 1)
     fuse("model.norm", ["lm_head"], hidden)
+    enabled = {space.name for space in spaces}
+    if enabled_rotation_spaces is not None:
+        requested = set(enabled_rotation_spaces)
+        if (
+            not requested
+            or len(requested) != len(enabled_rotation_spaces)
+            or not requested <= enabled
+        ):
+            raise ValueError("enabled_rotation_spaces must be unique known space names")
+        enabled = requested
     return RotationPlan(
-        spaces,
+        tuple(space for space in spaces if space.name in enabled),
         tuple(fusions),
-        embedding,
-        tuple(op for space in spaces for op in rotations[space.name]),
+        embedding if "rot" in enabled else None,
+        tuple(
+            op
+            for space in spaces
+            if space.name in enabled
+            for op in rotations[space.name]
+        ),
     )

@@ -86,6 +86,8 @@ class QuaRotModifier(Modifier):
 
     :param block_size: repeated Hadamard block size. None uses full dimensions
         except the shifted query-latent rotation, whose base block is 32.
+    :param enabled_rotation_spaces: None keeps all four spaces; an explicit list
+        selects complete compensation pairs while retaining all norm fusion.
     :param seed: local CPU RNG seed, reset independently for each rotation space
     :param precision: matrix construction and fusion arithmetic dtype. float32
         matches the ModelSlim reference; float64 minimizes offline rounding.
@@ -94,6 +96,8 @@ class QuaRotModifier(Modifier):
     block_size: int | None = Field(default=None, strict=True, gt=0)
     seed: int = Field(default=1234, strict=True, ge=0, le=2**63 - 1)
     precision: TorchDtype = Field(default=get_high_precision())
+
+    enabled_rotation_spaces: tuple[str, ...] | None = None
 
     _plan: RotationPlan | None = PrivateAttr(default=None)
     _matrices: dict[str, HadamardRotation] = PrivateAttr(default_factory=dict)
@@ -122,9 +126,10 @@ class QuaRotModifier(Modifier):
             )
         # Inspect cached shapes/identities without loading the whole model from disk.
         with OffloadCache.disable_onloading():
-            plan = build_glm_plan(model)
-            targets = {op.target for op in (plan.embedding, *plan.rotations)}
+            plan = build_glm_plan(model, self.enabled_rotation_spaces)
+            targets = {op.target for op in plan.operations}
             targets.update(fusion.norm for fusion in plan.fusions)
+            targets.update(name for fusion in plan.fusions for name in fusion.consumers)
             aliases = defaultdict(list)
             for name, parameter in model.named_parameters(remove_duplicate=False):
                 key = (
@@ -206,7 +211,7 @@ class QuaRotModifier(Modifier):
         try:
             plan = self._validate_model(state.model)
             if is_distributed():
-                targets = {op.target for op in (plan.embedding, *plan.rotations)}
+                targets = {op.target for op in plan.operations}
                 targets.update(fusion.norm for fusion in plan.fusions)
                 targets.update(name for f in plan.fusions for name in f.consumers)
                 layout = []
@@ -304,11 +309,9 @@ class QuaRotModifier(Modifier):
             with OffloadCache.disable_onloading():
                 tied = model.model.embed_tokens.weight is model.lm_head.weight
                 if is_distributed():
-                    targets = {
-                        op.target
-                        for op in (self._plan.embedding, *self._plan.rotations)
-                    }
+                    targets = {op.target for op in self._plan.operations}
                     targets.update(f.norm for f in self._plan.fusions)
+                    targets.update(n for f in self._plan.fusions for n in f.consumers)
                     for name in targets:
                         module = model.get_submodule(name)
                         for key in ("weight", "bias"):
@@ -331,6 +334,7 @@ class QuaRotModifier(Modifier):
             "seed": self.seed,
             "block_size": self.block_size,
             "precision": str(self.precision).removeprefix("torch."),
+            "enabled_rotation_spaces": [s.name for s in self._plan.spaces],
         }
         model.config.quarot_config = metadata
         try:
@@ -357,13 +361,22 @@ class QuaRotModifier(Modifier):
                         )
                     fusion_progress.complete()
                     rotation_progress = _QuaRotProgress(
-                        "rotation", 1 + len(self._plan.rotations)
+                        "rotation", len(self._plan.operations)
                     )
-                    for operation in rotation_progress.track(
-                        (self._plan.embedding, *self._plan.rotations)
-                    ):
+                    space_seconds = defaultdict(float)
+                    for operation in rotation_progress.track(self._plan.operations):
+                        operation_start = perf_counter()
                         self._rotate(model, operation)
+                        space_seconds[operation.space] += (
+                            perf_counter() - operation_start
+                        )
                     rotation_progress.complete()
+                    for space, seconds in space_seconds.items():
+                        logger.info(
+                            "[QuaRot] space {} complete: {:.2f} s (host wall)",
+                            space,
+                            seconds,
+                        )
             except Exception as caught:
                 error = caught
             finish_transform_phase(error, "QuaRot transform")
