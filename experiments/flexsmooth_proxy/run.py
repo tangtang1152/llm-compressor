@@ -307,7 +307,11 @@ def main():
     parser.add_argument("--context", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--device-map", default="auto")
+    parser.add_argument(
+        "--device-map", choices=["auto_offload", "auto"], default="auto_offload"
+    )
+    parser.add_argument("--offload-dir")
+    parser.add_argument("--max-memory", type=json.loads)
     parser.add_argument(
         "--dtype", choices=["float32", "bfloat16", "float16"], default="bfloat16"
     )
@@ -344,13 +348,39 @@ def main():
             args.model_path, local_files_only=True
         )
         splits = split_records(args.data, tokenizer, args.seed)
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_path,
-            local_files_only=True,
-            torch_dtype=getattr(torch, args.dtype),
-            device_map=args.device_map,
-            attn_implementation="eager",
-        ).eval()
+        import contextlib
+        import os
+
+        from llmcompressor.utils import load_context
+
+        from .offload import loader_options
+
+        if int(os.environ.get("WORLD_SIZE", "1")) != 1:
+            parser.error("capture requires a single process; do not use torchrun")
+        offload = args.device_map == "auto_offload"
+        if not offload and (args.offload_dir or args.max_memory):
+            parser.error("offload controls require --device-map auto_offload")
+        if args.device.startswith("npu"):
+            torch.npu.set_device(torch.device(args.device))
+        if args.device.startswith("cuda"):
+            torch.cuda.set_device(torch.device(args.device))
+        loading = (
+            loader_options(
+                getattr(torch, args.dtype), args.offload_dir, args.max_memory
+            )
+            if offload
+            else dict(
+                local_files_only=True,
+                torch_dtype=getattr(torch, args.dtype),
+                device_map="auto",
+                attn_implementation="eager",
+            )
+        )
+        # CT's special placement and MoE linearization are enabled together.
+        with load_context() if offload else contextlib.nullcontext():
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model_path, **loading
+            ).eval()
         capture(
             model,
             splits,
@@ -362,6 +392,11 @@ def main():
             args.device,
             args.model_path,
             args.seed,
+            sequential=offload,
+            loading={
+                k: str(v) if isinstance(v, torch.dtype) else v
+                for k, v in loading.items()
+            },
         )
     else:
         cache = validate_cache(

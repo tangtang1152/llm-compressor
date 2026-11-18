@@ -72,20 +72,45 @@ are disjoint document-hash/position pairs (not vocabulary token IDs). Insufficie
 independent tokens is an error. The same cache serves every proxy and objective.
 There is no automatic reuse of differently shaped older caches.
 
-The CLI baseline loader is Transformers `local_files_only=True`, eager attention,
-`device_map=auto`; this needs a server loader capable of the actual GLM-5.2
-architecture and enough aggregate memory. If the project's existing NPU/offload
-loader is required, call the capture API from that driver instead. No model was
-loaded locally. Hooks snapshot weights under CT align_module_device and observe
-the FIRST consumer's actual input, exactly like the production Modifier; mapping
-semantics establish that this input is shared by the other consumers.
+The default CLI loader now uses the QuaRot E2 path: `load_context()` with
+`device_map="auto_offload"`, a required NEW `--offload-dir`, and optional
+`--max-memory` JSON (numeric device keys become integers). CT manages CPU/disk
+weight backing; `load_context` also enables the existing MoE linearization.
+`set_onload_device` selects the execution device. LLMC sequential execution
+keeps only the current subgraph weights resident across its samples, then releases
+them; `IntermediatesCache` keeps intervening activations on CPU. Attention remains
+an opaque subgraph, with input norms and individual experts as additional
+boundaries. The graph stops immediately after the last selected layer's attention,
+before its MoE, subsequent layers and LM head. Earlier layers' original MoE
+forwards are necessary to obtain real Layer 40 inputs; no experts are smoothed or
+quantized. Internal consumer hooks still capture complete norm-linear groups.
+Tracing occurs before capture hooks are installed; duplicate or missing mapping /
+sample calls fail. Failure removes hooks and does not write a completed cache.
+
+This is single-process CPU/disk offload, NOT E2's eight-rank data partition and
+shared-backing path. `WORLD_SIZE>1` is rejected; use `python`, not `torchrun`.
+Use `--device-map auto` only as an explicit direct-forward fallback; it rejects
+offload-specific options. No full-model `.to(device)` or `.bfloat16()` is applied.
+Native dtype exceptions are preserved by the loader (the existing cache's shared
+weight concatenation can promote mixed consumer dtypes). The model path must be
+local. Reuse the historical server's capacity-checked max-memory budget rather
+than guessing device/RAM capacities; reserve room for attention workspace and
+CPU intermediate/reference caches. Disk backing is an additional model-size
+storage requirement and is never automatically removed. This is not tensor
+parallelism and does not guarantee the server memory budget will fit.
+
+Inspected source: `quarot-experiments` commit
+`492b1e109117f1eccedf67059b2669aada339102`, `e2_collect.py`, `e2_sequential.py` and
+`E2_IMPLEMENTATION.md`. Nothing in that branch or its results was modified.
+2026-11-18 fetches failed again (SSH process / DNS restrictions); not synced.
+Tests use synthetic tiny GLM only. Real full checkpoint loading/NPU remain untested.
 
 Original cache and BF16 references reside on CPU. Only one weight-row slab and
 one token batch/output reside on device. `--batch` and `--rows` tune memory;
 changing GEMM shapes can change rounding. Timing includes transfers and CPU
 FP64 reductions: it measures end-to-end experiment cost, not isolated kernel
 throughput. Search excludes reference preparation (recorded separately) and
-post-search diagnostics. Capture time covers hook forwards and copying, not
+post-search diagnostics. Capture time includes graph tracing, hook forwards and copying, not
 model loading/tokenization/initial weight snapshot. CPU peak RSS is process
 lifetime; device allocated/reserved peaks are process-lifetime allocator counters,
 not stage-exclusive peaks. NPU/CUDA timers synchronize before and after work.
@@ -100,13 +125,14 @@ compressed-tensors, transformers, accelerate, psutil, pytest; torch_npu for NPU.
 
 ```bash
 export PYTHONPATH="$PWD/src:$PWD${PYTHONPATH:+:$PYTHONPATH}"
-python -m pytest experiments/flexsmooth_proxy/test_core.py -q -p no:cacheprovider
+python -m pytest experiments/flexsmooth_proxy -q -p no:cacheprovider
 
 # Recommended first real GLM invocation: one mapping, 128 tokens per split.
 python -m experiments.flexsmooth_proxy.run capture \
   --model-path /server/models/GLM-5.2 --data /server/data/calibration.json \
   --layers 3 --mappings input_layernorm --tokens 128 --context 128 \
-  --seed 42 --dtype bfloat16 --device npu:0 --device-map auto \
+  --seed 42 --dtype bfloat16 --device npu:0 --device-map auto_offload \
+  --offload-dir /server/results/flex-e01-smoke-offload \
   --output /server/results/flex-e01-smoke/capture
 python -m experiments.flexsmooth_proxy.run search \
   --cache /server/results/flex-e01-smoke/capture/cache.pt --device npu:0 \
@@ -121,6 +147,7 @@ python -m experiments.flexsmooth_proxy.run capture \
   --model-path /server/models/GLM-5.2 --data /server/data/calibration.json \
   --layers 3 40 --mappings input_layernorm q_a_layernorm \
   --tokens 2048 --context 2048 --seed 42 --dtype bfloat16 --device npu:0 \
+  --offload-dir /server/results/flex-e01-offload \
   --output /server/results/flex-e01/capture
 python -m experiments.flexsmooth_proxy.run search \
   --cache /server/results/flex-e01/capture/cache.pt --device npu:0 \
@@ -172,3 +199,9 @@ ties/grid, reproducibility, cache split rejection, capture/cleanup). 128-token
 BF16 synthetic smoke completed six searches and both targets, all E0 passed.
 Synthetic examples are plumbing evidence only, not GLM-5.2 quality conclusions.
 No real checkpoint, NPU, ModelSlim differential, Block or full-model run was used.
+
+2026-11-18 offload validation adds loader control tests and tiny GLM direct-vs-CT
+disk-backed sequential comparison, including exact original weights, activations
+and token identities and forbidden later-layer/LM-head hooks. No real model run.
+
+Final local check: all 16 tests passed, Ruff and git diff --check passed.

@@ -59,6 +59,8 @@ def capture(
     device="cpu",
     model_path="",
     seed=42,
+    sequential=False,
+    loading=None,
 ):
     if tokens < 1 or context < 1:
         raise ValueError("Positive tokens/context required")
@@ -77,6 +79,29 @@ def capture(
         raise ValueError("Requested layers/mappings were not resolved completely")
     if set(r[1] for r in splits[0]) & set(r[1] for r in splits[1]):
         raise ValueError("Calibration/validation document overlap")
+    # Preflight exact budgets before reading weights or executing any graph.
+    prepared = []
+    for records in splits:
+        batches, identities = [], []
+        for row, key, ids in records:
+            remaining = tokens - len(identities)
+            if not remaining:
+                break
+            ids = ids[: min(context, remaining)]
+            if not ids:
+                continue
+            input_ids = torch.tensor([ids])
+            batches.append(
+                dict(input_ids=input_ids, attention_mask=torch.ones_like(input_ids))
+            )
+            identities.extend(f"{key}:{pos}" for pos in range(len(ids)))
+        if len(identities) != tokens:
+            raise ValueError(
+                f"Insufficient independent split tokens: {len(identities)}/{tokens}"
+            )
+        prepared.append((batches, identities))
+    if len(prepared) != 2:
+        raise ValueError("Exactly calibration and validation splits required")
     groups = {}
     for m in plan:
         weights = []
@@ -93,10 +118,25 @@ def capture(
         )
     sync(device)
     start = time.perf_counter()
-    for split, records in zip(("calibration", "validation"), splits):
+    execution = []
+    for split, (batches, identities) in zip(("calibration", "validation"), prepared):
         collected = {m.source: [] for m in plan}
-        identities = []
+        runner = None
+        if sequential:
+            from .offload import SequentialRunner
+
+            runner = SequentialRunner(model, batches, plan, device)
+        execution.append(
+            dict(split=split, subgraphs=len(runner.subgraphs) if runner else None)
+        )
         current = [0]
+        current_batch = [0]
+        seen = set()
+
+        def before_batch(index):
+            current_batch[0] = index
+            current[0] = batches[index]["input_ids"].shape[1]
+
         handles = []
 
         def hook(key):
@@ -104,6 +144,10 @@ def capture(
                 x = args[0] if args else kwargs["input"]
                 if x.ndim != 3 or x.shape[0] != 1 or x.shape[1] != current[0]:
                     raise ValueError("Capture expects one unpadded prefill")
+                identity = (key, current_batch[0])
+                if identity in seen:
+                    raise ValueError("Duplicate mapping input capture")
+                seen.add(identity)
                 collected[key].append(x.detach().reshape(-1, x.shape[-1]).cpu().clone())
 
             return receive
@@ -115,23 +159,16 @@ def capture(
                         hook(m.source), with_kwargs=True
                     )
                 )
-            for row, key, ids in records:
-                remaining = tokens - len(identities)
-                if not remaining:
-                    break
-                ids = ids[: min(context, remaining)]
-                current[0] = len(ids)
-                input_ids = torch.tensor([ids], device=device)
-                model(
-                    input_ids=input_ids,
-                    attention_mask=torch.ones_like(input_ids),
-                    use_cache=False,
-                )
-                identities.extend(f"{key}:{pos}" for pos in range(len(ids)))
-            if len(identities) != tokens:
-                raise ValueError(
-                    f"Insufficient independent {split} tokens: {len(identities)}/{tokens}"  # noqa: E501
-                )
+            if runner:
+                runner.run(batches, before_batch)
+            else:
+                for index, batch in enumerate(batches):
+                    before_batch(index)
+                    model(
+                        **{k: v.to(device) for k, v in batch.items()}, use_cache=False
+                    )
+            if len(seen) != len(plan) * len(batches):
+                raise ValueError("Incomplete mapping/sample capture")
         finally:
             for h in handles:
                 h.remove()
@@ -143,6 +180,15 @@ def capture(
     sync(device)
     cache = dict(
         schema=1,
+        capture_backend="sequential" if sequential else "direct",
+        execution=execution,
+        loading=loading,
+        capture_source_sha256={
+            name: hashlib.sha256(
+                Path(__file__).with_name(name).read_bytes()
+            ).hexdigest()
+            for name in ("capture.py", "offload.py")
+        },
         kind="real",
         groups=groups,
         seed=seed,
