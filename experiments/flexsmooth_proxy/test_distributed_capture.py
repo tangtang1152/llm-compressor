@@ -1,7 +1,6 @@
 """CPU contracts; actual shared-backing two-process test additionally needs Linux."""
 
 import copy
-import json
 import sys
 import time
 from datetime import timedelta
@@ -20,7 +19,7 @@ from .distributed_capture import (
     prepare,
     split_for_rank,
 )
-from .e2_collect import backing_signature, phase, require_gate, runtime_contract
+from .e2_collect import backing_signature, phase, runtime_contract
 from .run import evaluate, search, synthetic
 from .test_offload import scratch
 
@@ -225,22 +224,7 @@ def test_comparison_reports_numeric_difference():
     assert rows[1]["max_abs"] > 0 and not rows[1]["bitwise_equal"]
 
 
-def test_gates_and_failure_handshake(monkeypatch):
-    path = scratch() / "gate.json"
-    gate = dict(
-        status="complete",
-        mode="smoke",
-        signature={"version": 1},
-        comparison_passed=True,
-    )
-    path.write_text(json.dumps(gate))
-    require_gate(path, {"version": 1}, "smoke")
-    with pytest.raises(ValueError):
-        require_gate(path, {"version": 2}, "smoke")
-    gate["comparison_passed"] = False
-    path.write_text(json.dumps(gate))
-    with pytest.raises(ValueError):
-        require_gate(path, {"version": 1}, "smoke")
+def test_failure_handshake(monkeypatch):
     import torch.distributed as dist
 
     monkeypatch.setattr(dist, "get_world_size", lambda: 2)
@@ -290,6 +274,48 @@ def tiny_model():
     cfg._attn_implementation = "eager"
     cfg.dtype = torch.bfloat16
     return GlmMoeDsaForCausalLM(cfg).bfloat16().eval()
+
+
+@pytest.mark.parametrize("fail_smoke", [False, True])
+def test_one_model_smoke_then_formal(monkeypatch, fail_smoke):
+    from . import e2_collect as collector
+
+    path = scratch()
+    model = object()
+    calls = []
+    reference = merge_shards(parts())
+    if fail_smoke:
+        next(iter(reference["groups"].values()))["validation"].add_(10)
+    monkeypatch.setattr(collector, "phase", lambda fn: fn())
+    monkeypatch.setattr(collector, "load_cache", lambda p: reference)
+
+    def fake_capture(current, records, rank, source, layers, mappings, tokens, *args):
+        assert current is model
+        calls.append((layers, tokens))
+        root = path / ("capture-smoke" if tokens == 128 else "capture")
+        shards = parts()
+        for s in shards:
+            s.update(forward_seconds=1, trace_seconds=0, weight_snapshot_seconds=0)
+        torch.save(shards[1], root / "rank1.pt")
+        return shards[0]
+
+    monkeypatch.setattr(collector, "capture_split", fake_capture)
+    splits = ([(0, "cal", [1] * 2048)], [(1, "val", [2] * 2048)])
+
+    def run():
+        return collector.run_captures(
+            model, splits, {}, "cpu", path, path / "old.pt", 0, 2048, lambda: None, 0, 0
+        )
+
+    if fail_smoke:
+        with pytest.raises(ValueError, match="Smoke differs"):
+            run()
+        assert not (path / "capture").exists()
+    else:
+        assert len(run()) == 2
+        assert calls == [([3], 128), ([6, 16, 60, 77], 2048)]
+        assert (path / "capture/cache.pt").exists()
+    assert "max_memory" not in collector.loading_options(path)
 
 
 def tiny_inputs():
