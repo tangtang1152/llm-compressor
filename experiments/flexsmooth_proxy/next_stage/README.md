@@ -1,5 +1,10 @@
 # P1 性能 + E2 扩大层采样（E3 已暂缓）
 
+2026-11-20 更新：P1 已完成，不要重跑。E2 capture 现在按用户要求使用
+[QuaRot E2 多 rank 数据并行方案](../DISTRIBUTED_CAPTURE.md)，默认最多 8 rank，
+只按完整序列分片，序列不足时减少有效计算 rank。以下旧单进程 capture/max-memory
+命令保留作历史记录，不作为当前执行方案；search/evaluate/analyze 仍由本目录提供。
+
 用户已明确暂缓 Block/Attention 实验。本目录只提供 P1/E2，不包含 Block
 捕获或量化入口。生产 FlexSmooth、QuaRot、CT、旧 core.py/search/capture 均未修改。
 
