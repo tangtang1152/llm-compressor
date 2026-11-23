@@ -72,6 +72,7 @@ def capture_split(
     context,
     device,
     check=lambda: None,
+    mapping_kind="norm-linear",
 ):
     sync(device)
     capture_start = time.perf_counter()
@@ -103,7 +104,7 @@ def capture_split(
         raise ValueError("Rank assignment splits an original prefill")
     plan = [
         m
-        for m in glm_mappings(model, ("norm-linear",))
+        for m in glm_mappings(model, (mapping_kind,))
         if int(m.source.split(".")[2]) in layers and m.source.split(".")[-1] in mappings
     ]
     if len(plan) != len(layers) * len(mappings):
@@ -125,6 +126,10 @@ def capture_split(
             weight=weight,
             weight_hash=digest(weight),
         )
+        if mapping_kind == "ov":
+            groups[m.source]["geometry"] = dict(
+                heads=m.heads, value_dim=m.value_dim, key_dim=m.key_dim
+            )
     weight_seconds = time.perf_counter() - capture_start
     trace_start = time.perf_counter()
     runner = SequentialRunner(model, batches, plan, device) if batches else None
@@ -257,6 +262,12 @@ def merge_shards(shards):
             k: left[k]
             for k in ("weight", "consumers", "consumer_rows", "consumer_dtypes")
         }
+        if "geometry" in left:
+            if any(
+                s["groups"][name].get("geometry") != left["geometry"] for s in shards
+            ):
+                raise ValueError("OV geometry differs across ranks")
+            g["geometry"] = left["geometry"]
         for s in shards:
             part = s["groups"][name]
             split = s["split"]

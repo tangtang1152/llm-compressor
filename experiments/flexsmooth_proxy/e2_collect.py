@@ -240,6 +240,11 @@ def main():
     for name in ("model-path", "data", "old-cache", "output", "offload-dir"):
         p.add_argument("--" + name, type=Path, required=True)
     p.add_argument("--reference-cache", type=Path)
+    p.add_argument(
+        "--ov-only",
+        action="store_true",
+        help="Only new o_proj inputs; reuse E2 identities",
+    )
     p.add_argument("--context", type=int, default=2048)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--threads", type=int, default=4)
@@ -386,7 +391,12 @@ def main():
             raise ValueError("Ranks do not share backing")
         status.update(stage="capturing", shared_backing=shared, memory=memory(device))
         atomic_json(args.output / f"status-rank{rank}.json", status)
-        status["timings"] = run_captures(
+        runner = run_captures
+        if args.ov_only:
+            from .recipe_mxfp8.capture import run_ov
+
+            runner = run_ov
+        status["timings"] = runner(
             model,
             splits,
             source,
@@ -435,7 +445,12 @@ def main():
                 cache_sha256=file_hash(args.output / "capture/cache.pt"),
             )
             (args.output / "report.md").write_text(
-                "# Two-rank capture\n\nOne model load per rank; Smoke comparison and formal shard validation passed.\n\nSee timings.csv for measured load/capture/wall time, capture-smoke/comparison.csv for numeric differences, and complete.json for memory/source records.\n",
+                (
+                    "# Incremental OV capture\n\nOriginal E2 identities and rank shard validation passed. Native OV compensation is tested separately; no real Attention equivalence measurement is claimed here.\n"
+                    if args.ov_only
+                    else "# Two-rank capture\n\nOne model load per rank; Smoke comparison and formal shard validation passed.\n"
+                )
+                + "\nSee timings.csv and complete.json for measured timing, memory and source records.\n",
                 encoding="utf-8",
             )
             atomic_json(args.output / "complete.json", report)

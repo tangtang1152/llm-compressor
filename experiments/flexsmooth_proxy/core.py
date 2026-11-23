@@ -166,6 +166,9 @@ class Objective:
             finite=math.isfinite(nmse),
         )
 
+    def applied_scale(self, alpha, beta):
+        return smooth_scale(self.amax, self.wmax, alpha, beta)
+
     def search(self, proxy, activation):
         candidates = []
 
@@ -191,7 +194,7 @@ class Objective:
         result = _search_candidates(evaluate)
         sync(self.device)
         elapsed = time.perf_counter() - start
-        scale = smooth_scale(self.amax, self.wmax, result.alpha, result.beta)
+        scale = self.applied_scale(result.alpha, result.beta)
         if not torch.isfinite(scale).all() or not (scale > 0).all():
             raise ValueError("Selected applied scale is invalid")
         return dict(
